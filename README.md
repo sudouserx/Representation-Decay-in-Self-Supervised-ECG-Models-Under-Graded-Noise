@@ -137,4 +137,3 @@ All decisions are configurable via `ecg_ssl_utils/config.py`:
 | ECE | $\sum (|B_m|/n) \cdot |acc(B_m) - conf(B_m)|$ | Guo et al., ICML 2017 |
 | DeLong Test Z-stat | $\frac{\hat{\theta}_A - \hat{\theta}_B}{\sqrt{\text{Var}(\hat{\theta}_A) + \text{Var}(\hat{\theta}_B) - 2\text{Cov}(\hat{\theta}_A, \hat{\theta}_B)}}$ | DeLong et al., Biometrics 1988 |
 | DSS | $\alpha(1-\Delta CKA\_n) + \dots + \delta(1-Latency\_n)$ | DSS Proposal (This project) |
-# Representation-Decay-in-Self-Supervised-ECG-Models-Under-Graded-Noise
