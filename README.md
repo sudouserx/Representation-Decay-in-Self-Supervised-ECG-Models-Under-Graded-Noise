@@ -129,11 +129,11 @@ All decisions are configurable via `ecg_ssl_utils/config.py`:
 |---|---|---|
 | SNR-scaled injection | $x_{\text{noisy}} = x + \sqrt{\frac{P_{\text{target}}}{P_{\text{raw}}}} \cdot n_{\text{raw}}$ | Signal Processing Standard |
 | NT-Xent (SimCLR) | $-\log \frac{\exp(\text{sim}(z_i, z_j) / \tau)}{\sum_{k} \mathbb{1} \exp(\text{sim}(z_i, z_k) / \tau)}$ | Chen et al., ICML 2020 |
-| MAE | $\frac{1}{\|\mathcal{M}\|} \sum_{i \in \mathcal{M}} \| x_i - \hat{x}_i \|^2$ | He et al., CVPR 2022 |
-| JEPA | $\frac{1}{\|\mathcal{T}\|} \sum_{i \in \mathcal{T}} \| \hat{s}_{y,i} - \text{sg}(s_{y,i}) \|^2$ | Assran et al., CVPR 2023 |
-| BYOL | $2 - 2 \cdot \frac{\langle q_\theta(z_1), z_2' \rangle}{\|q_\theta(z_1)\| \cdot \|z_2'\|}$ | Grill et al., NeurIPS 2020 |
-| Linear CKA | $\frac{\|Y^\top X\|_F^2}{\|X^\top X\|_F \cdot \|Y^\top Y\|_F}$ | Kornblith et al., ICML 2019 |
+| MAE | $\frac{1}{\Vert\mathcal{M}\Vert} \sum_{i \in \mathcal{M}} \Vert x_i - \hat{x}_i \Vert^2$ | He et al., CVPR 2022 |
+| JEPA | $\frac{1}{\Vert\mathcal{T}\Vert} \sum_{i \in \mathcal{T}} \Vert \hat{s}_{y,i} - \text{sg}(s_{y,i}) \Vert^2$ | Assran et al., CVPR 2023 |
+| BYOL | $2 - 2 \cdot \frac{\langle q_\theta(z_1), z_2' \rangle}{\Vert q_\theta(z_1)\Vert \cdot \Vert z_2'\Vert}$ | Grill et al., NeurIPS 2020 |
+| Linear CKA | $\frac{\Vert Y^\top X\Vert_F^2}{\Vert X^\top X\Vert_F \cdot \Vert Y^\top Y\Vert_F}$ | Kornblith et al., ICML 2019 |
 | Effective Rank | $\exp(-\sum \bar{\sigma}_i \ln(\bar{\sigma}_i))$ | Roy & Vetterli, 2007 |
-| ECE | $\sum (|B_m|/n) \cdot |acc(B_m) - conf(B_m)|$ | Guo et al., ICML 2017 |
+| ECE | $\sum (\vert B_m\vert/n) \cdot \vert acc(B_m) - conf(B_m)\vert$ | Guo et al., ICML 2017 |
 | DeLong Test Z-stat | $\frac{\hat{\theta}_A - \hat{\theta}_B}{\sqrt{\text{Var}(\hat{\theta}_A) + \text{Var}(\hat{\theta}_B) - 2\text{Cov}(\hat{\theta}_A, \hat{\theta}_B)}}$ | DeLong et al., Biometrics 1988 |
 | DSS | $\alpha(1-\Delta CKA\_n) + \dots + \delta(1-Latency\_n)$ | DSS Proposal (This project) |
