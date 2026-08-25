@@ -87,12 +87,14 @@ class SSLTrainingConfig:
     checkpoint_every: int = 20
     num_workers: int = 4
     pin_memory: bool = True
+    grad_accum_steps: int = 4            # effective batch = 256 × 4 = 1024
+    grad_clip_norm: float = 1.0          # max gradient norm for clipping
 
 
 @dataclass
 class SimCLRConfig:
     """SimCLR-specific hyperparameters."""
-    temperature: float = 0.1
+    temperature: float = 0.5             # Chen et al. 2020 default
     proj_hidden_dim: int = 384
     proj_output_dim: int = 128
 

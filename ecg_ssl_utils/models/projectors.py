@@ -10,20 +10,25 @@ class MLPProjector(nn.Module):
     """
     2-layer MLP projection head (used by SimCLR, CLOCS, SwAV).
 
-    Architecture: Linear → BN → ReLU → Linear
+    Architecture: Linear → LN → ReLU → Linear
+
+    Uses LayerNorm instead of BatchNorm for AMP (mixed-precision) safety.
+    BatchNorm running statistics can underflow in float16, causing
+    representation collapse. LayerNorm is per-sample and inherently stable.
     """
 
     def __init__(self, in_dim: int = 384, hidden_dim: int = 384, out_dim: int = 128):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, out_dim),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
+
 
 
 class MLPPredictor(nn.Module):
