@@ -66,6 +66,11 @@ class CLOCSTrainer:
         """
         Temporal contrastive loss: two halves of the same recording
         are positive pairs.
+
+        Uses linear interpolation (not zero-padding) to stretch each
+        half-segment back to full length. Zero-padding creates 50%
+        identical zero-patches that act as a shared anchor, making the
+        contrastive task trivially easy.
         """
         B, C, L = batch.shape
         half = self.segment_length
@@ -73,9 +78,9 @@ class CLOCSTrainer:
         seg1 = batch[:, :, :half]     # first half
         seg2 = batch[:, :, half:2*half] if 2*half <= L else batch[:, :, L-half:]
 
-        # Pad segments to match encoder input
-        seg1 = F.pad(seg1, (0, L - half))
-        seg2 = F.pad(seg2, (0, L - half))
+        # Interpolate segments to full length (preserves morphology, no zero artifacts)
+        seg1 = F.interpolate(seg1, size=L, mode='linear', align_corners=False)
+        seg2 = F.interpolate(seg2, size=L, mode='linear', align_corners=False)
 
         h1 = self.encoder(seg1)
         h2 = self.encoder(seg2)
@@ -92,15 +97,26 @@ class CLOCSTrainer:
         """
         Spatial/lead contrastive loss: two lead groups from the same
         recording are positive pairs.
+
+        Masked leads are filled with Gaussian noise at the signal's
+        global scale (not zeroed). Zeroing creates a detectable structural
+        pattern (50% of each patch is exactly zero), letting the patch
+        embedding shortcut around learning ECG morphology.
         """
         B, C, L = batch.shape
 
-        # Select lead groups, zero out the other leads
+        # Noise at global signal scale prevents structural detection
+        noise_std = batch.std()
+
         view_a = batch.clone()
-        view_a[:, self.lead_group_b, :] = 0.0
+        view_a[:, self.lead_group_b, :] = torch.randn_like(
+            view_a[:, self.lead_group_b, :]
+        ) * noise_std
 
         view_b = batch.clone()
-        view_b[:, self.lead_group_a, :] = 0.0
+        view_b[:, self.lead_group_a, :] = torch.randn_like(
+            view_b[:, self.lead_group_a, :]
+        ) * noise_std
 
         h_a = self.encoder(view_a)
         h_b = self.encoder(view_b)

@@ -102,7 +102,7 @@ class SimCLRConfig:
 @dataclass
 class CLOCSConfig:
     """CLOCS-specific hyperparameters."""
-    temperature: float = 0.1
+    temperature: float = 0.5             # τ=0.1 too aggressive with B=64
     proj_hidden_dim: int = 384
     proj_output_dim: int = 128
     lambda_temporal: float = 1.0
