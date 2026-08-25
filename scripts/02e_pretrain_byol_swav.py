@@ -28,133 +28,211 @@ from ecg_ssl_utils.ssl.clocs import CLOCSTrainer
 import pandas as pd
 
 
+# ── Collapse early-stopping thresholds (for contrastive methods) ──
+COLLAPSE_STD_THRESHOLD = 1e-4
+COLLAPSE_SIM_THRESHOLD = 0.95
+COLLAPSE_PATIENCE = 5
+
+
+def _make_warmup_scheduler(optimizer, warmup_epochs, total_epochs, min_lr):
+    """Create a SequentialLR with linear warmup + cosine decay."""
+    warmup = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=0.01, total_iters=warmup_epochs,
+    )
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=total_epochs - warmup_epochs, eta_min=min_lr,
+    )
+    return torch.optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs],
+    )
+
+
 def train_byol(cfg, loader, device):
     out_dir = '/kaggle/working/ssl-byol-vit-small'
     os.makedirs(out_dir, exist_ok=True)
-    
+    total_epochs = cfg.ssl_training.epochs
+    warmup_epochs = cfg.ssl_training.warmup_epochs
+
     encoder = ViTSmall1D(patch_size=cfg.backbone.patch_size, embed_dim=cfg.backbone.embed_dim,
                          depth=cfg.backbone.depth, num_heads=cfg.backbone.num_heads)
     projector = BYOLProjector(cfg.backbone.embed_dim, cfg.byol.projector_hidden_dim, cfg.byol.projector_output_dim)
     predictor = MLPPredictor(cfg.byol.projector_output_dim, cfg.byol.predictor_hidden_dim, cfg.byol.predictor_output_dim)
-    
+
     params = list(encoder.parameters()) + list(projector.parameters()) + list(predictor.parameters())
     optimizer = torch.optim.AdamW(params, lr=cfg.ssl_training.lr, weight_decay=cfg.ssl_training.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, cfg.ssl_training.epochs, cfg.ssl_training.min_lr)
-    
+    scheduler = _make_warmup_scheduler(optimizer, warmup_epochs, total_epochs, cfg.ssl_training.min_lr)
+
     trainer = BYOLTrainer(
         encoder, projector, predictor, ECGAugmentation(), optimizer, scheduler,
         ema_start=cfg.byol.ema_momentum_start, ema_end=cfg.byol.ema_momentum_end,
-        total_epochs=cfg.ssl_training.epochs, use_amp=cfg.ssl_training.use_amp, device=device
+        total_epochs=total_epochs, use_amp=cfg.ssl_training.use_amp, device=device,
+        grad_clip_norm=cfg.ssl_training.grad_clip_norm,
     )
-    
+
     log = open(os.path.join(out_dir, 'train_log.csv'), 'w')
-    log.write('epoch,loss,lr\n')
-    for epoch in range(cfg.ssl_training.epochs):
+    log.write('epoch,loss,lr,time_s\n')
+
+    print(f"  Warmup: {warmup_epochs} epochs | Grad clip: {cfg.ssl_training.grad_clip_norm}")
+
+    for epoch in range(total_epochs):
+        t0 = time.time()
         losses = [trainer.train_step(b[0], epoch) for b in loader]
         scheduler.step()
         avg = np.mean(losses)
         lr = optimizer.param_groups[0]['lr']
-        log.write(f'{epoch},{avg:.6f},{lr:.8f}\n')
-        if epoch % 10 == 0: print(f"BYOL Epoch {epoch:3d} | Loss: {avg:.4f}")
-    
+        elapsed = time.time() - t0
+        log.write(f'{epoch},{avg:.6f},{lr:.8f},{elapsed:.1f}\n')
+        if epoch % 10 == 0 or epoch < 5 or epoch == total_epochs - 1:
+            print(f"  BYOL Epoch {epoch:3d} | Loss: {avg:.4f} | LR: {lr:.6f} | {elapsed:.0f}s")
+
     log.close()
     torch.save(trainer.online_encoder.state_dict(), os.path.join(out_dir, 'encoder.pt'))
-    with open(os.path.join(out_dir,'config.json'),'w') as f:
-        json.dump({'paradigm':'byol','backbone':'vit_small_1d'}, f)
+    with open(os.path.join(out_dir, 'config.json'), 'w') as f:
+        json.dump({'paradigm': 'byol', 'backbone': 'vit_small_1d',
+                   'warmup_epochs': warmup_epochs,
+                   'grad_clip_norm': cfg.ssl_training.grad_clip_norm}, f, indent=2)
+    print(f"  ✓ BYOL complete! Saved to {out_dir}")
 
 
 def train_swav(cfg, loader, device):
     out_dir = '/kaggle/working/ssl-swav-vit-small'
     os.makedirs(out_dir, exist_ok=True)
-    
+    total_epochs = cfg.ssl_training.epochs
+    warmup_epochs = cfg.ssl_training.warmup_epochs
+
     encoder = ViTSmall1D(patch_size=cfg.backbone.patch_size, embed_dim=cfg.backbone.embed_dim,
                          depth=cfg.backbone.depth, num_heads=cfg.backbone.num_heads)
     projector = MLPProjector(cfg.backbone.embed_dim, cfg.swav.proj_hidden_dim, cfg.swav.proj_output_dim)
     prototypes = SwAVPrototypes(cfg.swav.proj_output_dim, cfg.swav.num_prototypes)
-    
+
     params = list(encoder.parameters()) + list(projector.parameters()) + list(prototypes.parameters())
     optimizer = torch.optim.AdamW(params, lr=cfg.ssl_training.lr, weight_decay=cfg.ssl_training.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, cfg.ssl_training.epochs, cfg.ssl_training.min_lr)
-    
+    scheduler = _make_warmup_scheduler(optimizer, warmup_epochs, total_epochs, cfg.ssl_training.min_lr)
+
     trainer = SwAVTrainer(
         encoder, projector, prototypes, ECGAugmentation(), optimizer, scheduler,
         temperature=cfg.swav.temperature, sinkhorn_iters=cfg.swav.sinkhorn_iterations,
-        sinkhorn_eps=cfg.swav.sinkhorn_epsilon, use_amp=cfg.ssl_training.use_amp, device=device
+        sinkhorn_eps=cfg.swav.sinkhorn_epsilon, use_amp=cfg.ssl_training.use_amp, device=device,
+        grad_clip_norm=cfg.ssl_training.grad_clip_norm,
     )
-    
+
     log = open(os.path.join(out_dir, 'train_log.csv'), 'w')
-    log.write('epoch,loss,lr\n')
-    for epoch in range(cfg.ssl_training.epochs):
+    log.write('epoch,loss,lr,time_s\n')
+
+    print(f"  Warmup: {warmup_epochs} epochs | Grad clip: {cfg.ssl_training.grad_clip_norm}")
+
+    for epoch in range(total_epochs):
+        t0 = time.time()
         losses = [trainer.train_step(b[0]) for b in loader]
         scheduler.step()
         avg = np.mean(losses)
         lr = optimizer.param_groups[0]['lr']
-        log.write(f'{epoch},{avg:.6f},{lr:.8f}\n')
-        if epoch % 10 == 0: print(f"SwAV Epoch {epoch:3d} | Loss: {avg:.4f}")
-    
+        elapsed = time.time() - t0
+        log.write(f'{epoch},{avg:.6f},{lr:.8f},{elapsed:.1f}\n')
+        if epoch % 10 == 0 or epoch < 5 or epoch == total_epochs - 1:
+            print(f"  SwAV Epoch {epoch:3d} | Loss: {avg:.4f} | LR: {lr:.6f} | {elapsed:.0f}s")
+
     log.close()
     torch.save(encoder.state_dict(), os.path.join(out_dir, 'encoder.pt'))
-    with open(os.path.join(out_dir,'config.json'),'w') as f:
-        json.dump({'paradigm':'swav','backbone':'vit_small_1d'}, f)
+    with open(os.path.join(out_dir, 'config.json'), 'w') as f:
+        json.dump({'paradigm': 'swav', 'backbone': 'vit_small_1d',
+                   'warmup_epochs': warmup_epochs,
+                   'grad_clip_norm': cfg.ssl_training.grad_clip_norm}, f, indent=2)
+    print(f"  ✓ SwAV complete! Saved to {out_dir}")
 
 
 def train_clocs_resnet(cfg, signals, patient_ids, device):
     out_dir = '/kaggle/working/ssl-clocs-resnet18'
     os.makedirs(out_dir, exist_ok=True)
-    
+    total_epochs = cfg.ssl_training.epochs
+    warmup_epochs = cfg.ssl_training.warmup_epochs
+
     dataset = TensorDataset(torch.tensor(signals, dtype=torch.float32), patient_ids)
     loader = DataLoader(dataset, batch_size=cfg.ssl_training.batch_size, shuffle=True,
                         num_workers=cfg.ssl_training.num_workers, drop_last=True)
-                        
+
     encoder = ResNet18_1D(in_channels=12, output_dim=cfg.backbone.embed_dim)
     projector = MLPProjector(cfg.backbone.embed_dim, cfg.clocs.proj_hidden_dim, cfg.clocs.proj_output_dim)
-    
+
     params = list(encoder.parameters()) + list(projector.parameters())
     optimizer = torch.optim.AdamW(params, lr=cfg.ssl_training.lr, weight_decay=cfg.ssl_training.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, cfg.ssl_training.epochs, cfg.ssl_training.min_lr)
-    
+    scheduler = _make_warmup_scheduler(optimizer, warmup_epochs, total_epochs, cfg.ssl_training.min_lr)
+
     trainer = CLOCSTrainer(encoder, projector, optimizer, scheduler,
                            temperature=cfg.clocs.temperature, lambda_temporal=cfg.clocs.lambda_temporal,
                            lambda_spatial=cfg.clocs.lambda_spatial, lambda_patient=cfg.clocs.lambda_patient,
-                           use_amp=cfg.ssl_training.use_amp, device=device)
-                           
+                           use_amp=cfg.ssl_training.use_amp, device=device,
+                           grad_clip_norm=cfg.ssl_training.grad_clip_norm)
+
     log = open(os.path.join(out_dir, 'train_log.csv'), 'w')
-    log.write('epoch,loss,lr\n')
-    for epoch in range(cfg.ssl_training.epochs):
+    log.write('epoch,loss,lr,time_s,embed_std,avg_cosine_sim\n')
+
+    print(f"  Warmup: {warmup_epochs} epochs | Grad clip: {cfg.ssl_training.grad_clip_norm}")
+
+    collapse_counter = 0
+    for epoch in range(total_epochs):
+        t0 = time.time()
         ep_losses = [trainer.train_step(b[0], b[1])['total'] for b in loader]
         scheduler.step()
         avg = np.mean(ep_losses)
         lr = optimizer.param_groups[0]['lr']
-        log.write(f'{epoch},{avg:.6f},{lr:.8f}\n')
-        if epoch % 10 == 0: print(f"CLOCS-ResNet18 Epoch {epoch:3d} | Loss: {avg:.4f}")
-    
+        elapsed = time.time() - t0
+
+        # Collapse diagnostics for contrastive method
+        if epoch % 10 == 0 or epoch < 5 or epoch == total_epochs - 1:
+            metrics = trainer.compute_collapse_metrics()
+            embed_std = metrics['embed_std']
+            avg_cosine_sim = metrics['avg_cosine_sim']
+            print(f"  CLOCS-RN18 Epoch {epoch:3d} | Loss: {avg:.4f} | LR: {lr:.6f} | "
+                  f"{elapsed:.0f}s | std: {embed_std:.4f} | cos_sim: {avg_cosine_sim:.4f}")
+
+            if embed_std < COLLAPSE_STD_THRESHOLD or avg_cosine_sim > COLLAPSE_SIM_THRESHOLD:
+                collapse_counter += 1
+                print(f"  ⚠ COLLAPSE WARNING ({collapse_counter}/{COLLAPSE_PATIENCE})")
+                if collapse_counter >= COLLAPSE_PATIENCE:
+                    print(f"\n✗ CLOCS-ResNet18 HALTED: Representation collapse detected.")
+                    break
+            else:
+                collapse_counter = 0
+        else:
+            embed_std = float('nan')
+            avg_cosine_sim = float('nan')
+
+        log.write(f'{epoch},{avg:.6f},{lr:.8f},{elapsed:.1f},{embed_std:.6f},{avg_cosine_sim:.6f}\n')
+
     log.close()
     torch.save(encoder.state_dict(), os.path.join(out_dir, 'encoder.pt'))
-    with open(os.path.join(out_dir,'config.json'),'w') as f:
-        json.dump({'paradigm':'clocs','backbone':'resnet18_1d'}, f)
+    with open(os.path.join(out_dir, 'config.json'), 'w') as f:
+        json.dump({'paradigm': 'clocs', 'backbone': 'resnet18_1d',
+                   'warmup_epochs': warmup_epochs,
+                   'grad_clip_norm': cfg.ssl_training.grad_clip_norm}, f, indent=2)
+    print(f"  ✓ CLOCS-ResNet18 complete! Saved to {out_dir}")
 
 
 def main():
     cfg = get_config()
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    
+    print(f"Device: {device}")
+
     signals = np.load(os.path.join(CLEAN_DIR, 'signals_train.npy'))
+    print(f"Training signals: {signals.shape}")
+
     loader = DataLoader(TensorDataset(torch.tensor(signals, dtype=torch.float32)),
                         batch_size=cfg.ssl_training.batch_size, shuffle=True,
                         num_workers=cfg.ssl_training.num_workers, drop_last=True)
-    
-    print("=== Training BYOL ===")
+
+    print("\n=== Training BYOL ===")
     train_byol(cfg, loader, device)
-    
-    print("=== Training SwAV ===")
+
+    print("\n=== Training SwAV ===")
     train_swav(cfg, loader, device)
-    
-    print("=== Training CLOCS-ResNet18 ===")
+
+    print("\n=== Training CLOCS-ResNet18 ===")
     meta = pd.read_parquet(os.path.join(CLEAN_DIR, 'metadata.parquet'))
     train_meta = meta[meta['split'] == 'train'].reset_index(drop=True)
     patient_ids = torch.tensor(train_meta['patient_id'].values, dtype=torch.long)
     train_clocs_resnet(cfg, signals, patient_ids, device)
-    
-    print("✓ All sensitivity arms trained!")
+
+    print("\n✓ All sensitivity arms trained!")
 
 if __name__ == '__main__': main()
