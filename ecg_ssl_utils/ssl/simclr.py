@@ -50,7 +50,7 @@ def nt_xent_loss(
 
     # Mask out self-similarity (diagonal)
     mask = torch.eye(2 * B, device=device).bool()
-    sim.masked_fill_(mask, -1e9)
+    sim.masked_fill_(mask, float('-inf'))
 
     # Labels: positive pair for i is i+B (and vice versa)
     labels = torch.cat([
