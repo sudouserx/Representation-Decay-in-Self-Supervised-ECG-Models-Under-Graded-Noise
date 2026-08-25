@@ -44,8 +44,12 @@ def main():
     patient_ids = torch.tensor(train_meta['patient_id'].values, dtype=torch.long)
     print(f"Training signals: {signals.shape}")
 
+    # CLOCS runs the encoder 6× per batch (2× temporal + 2× spatial + 2× patient),
+    # requiring ~3× SimCLR's GPU memory. Override batch_size to avoid T4 OOM.
+    clocs_batch_size = min(cfg.ssl_training.batch_size, 64)
+
     dataset = TensorDataset(torch.tensor(signals, dtype=torch.float32), patient_ids)
-    loader = DataLoader(dataset, batch_size=cfg.ssl_training.batch_size,
+    loader = DataLoader(dataset, batch_size=clocs_batch_size,
                         shuffle=True, num_workers=cfg.ssl_training.num_workers,
                         pin_memory=True, drop_last=True)
 
@@ -101,6 +105,7 @@ def main():
                   'lr,time_s,embed_std,avg_cosine_sim\n')
 
     print(f"\nTraining CLOCS for {total_epochs} epochs")
+    print(f"  Batch size: {clocs_batch_size} (reduced from {cfg.ssl_training.batch_size} — 6 encoder fwd passes/step)")
     print(f"  Temperature: {cfg.clocs.temperature}")
     print(f"  Warmup: {warmup_epochs} epochs")
     print(f"  Grad clip norm: {cfg.ssl_training.grad_clip_norm}")
