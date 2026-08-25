@@ -1,0 +1,9 @@
+numpy
+pandas
+scipy
+scikit-learn
+matplotlib
+tqdm
+wfdb
+torch
+onnxruntime-gpu
