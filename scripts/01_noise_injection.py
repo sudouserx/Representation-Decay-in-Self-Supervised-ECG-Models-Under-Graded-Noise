@@ -115,7 +115,7 @@ def main():
     manifest = pd.DataFrame(manifest_rows)
     manifest.to_parquet(os.path.join(OUTPUT_DIR, 'noise_manifest.parquet'), index=False)
 
-    n_conditions = len(manifest.groupby(['noise_type', 'snr_db', 'seed']).ngroups)
+    n_conditions = manifest.groupby(['noise_type', 'snr_db', 'seed']).ngroups
     print(f"  Total manifest rows: {len(manifest)}")
     print(f"  Unique conditions: {n_conditions}")
     print(f"  Noise types: {manifest['noise_type'].unique().tolist()}")

@@ -88,7 +88,7 @@ def main():
     
     # 3. Report Artifacts
     # Leaderboard (averaged over conditions for simplicity here, or worst-case)
-    worst_case = dss_df[dss_df['snr_db'] == -6].groupby('model_id').mean().reset_index()
+    worst_case = dss_df[dss_df['snr_db'] == -6].groupby('model_id').mean(numeric_only=True).reset_index()
     generate_leaderboard(worst_case, deploy_df, os.path.join(OUTPUT_DIR, 'leaderboard.html'))
     
     # Decay Curves

@@ -67,8 +67,8 @@ def process_condition(clean_signals, manifest_subset, noise_bank, encoder, probe
         
         batch_noisy = []
         for j, (_, row) in enumerate(batch_manifest.iterrows()):
-            mixed_types = row['mixture_types'].split(',') if row['is_mixed'] else None
-            mixed_weights = [float(w) for w in row['mixture_weights'].split(',')] if row['is_mixed'] else None
+            mixed_types = row['mixture_types'].split(',') if row['is_mixed'] and row['mixture_types'] else None
+            mixed_weights = [float(w) for w in row['mixture_weights'].split(',')] if row['is_mixed'] and row['mixture_weights'] else None
             noisy = inject_noise(
                 batch_clean[j], noise_bank, row['noise_type'], row['snr_db'], 
                 row['seed'], row['record_id'], mixed_types, mixed_weights
