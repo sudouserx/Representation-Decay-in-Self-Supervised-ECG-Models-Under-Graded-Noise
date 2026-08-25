@@ -11,7 +11,8 @@ from typing import Optional
 class BYOLTrainer:
     def __init__(self, encoder, projector, predictor, augmentation,
                  optimizer, scheduler=None, ema_start=0.996, ema_end=1.0,
-                 total_epochs=200, use_amp=True, device='cuda'):
+                 total_epochs=200, use_amp=True, device='cuda',
+                 grad_clip_norm=1.0):
         self.online_encoder = encoder.to(device)
         self.online_projector = projector.to(device)
         self.predictor = predictor.to(device)
@@ -26,6 +27,7 @@ class BYOLTrainer:
         self.T = total_epochs
         self.amp = use_amp
         self.dev = device
+        self.grad_clip_norm = grad_clip_norm
         self.scaler = torch.amp.GradScaler('cuda') if use_amp else None
 
     @torch.no_grad()
@@ -52,12 +54,19 @@ class BYOLTrainer:
                 t1 = self.target_projector(self.target_encoder(v1))
                 t2 = self.target_projector(self.target_encoder(v2))
             loss = self._loss(o1, t2.detach()) + self._loss(o2, t1.detach())
+        _params = (list(self.online_encoder.parameters()) +
+                   list(self.online_projector.parameters()) +
+                   list(self.predictor.parameters()))
         if self.scaler:
             self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.opt)
+            nn.utils.clip_grad_norm_(_params, self.grad_clip_norm)
             self.scaler.step(self.opt)
             self.scaler.update()
         else:
-            loss.backward(); self.opt.step()
+            loss.backward()
+            nn.utils.clip_grad_norm_(_params, self.grad_clip_norm)
+            self.opt.step()
         m = 1-(1-self.ema_s)*0.5*(1+math.cos(math.pi*epoch/self.T))
         self._update_target(m)
         return loss.item()

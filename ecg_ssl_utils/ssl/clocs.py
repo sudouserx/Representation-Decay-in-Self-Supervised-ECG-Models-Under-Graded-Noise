@@ -40,6 +40,7 @@ class CLOCSTrainer:
         lead_group_b: List[int] = None,
         use_amp: bool = True,
         device: str = 'cuda',
+        grad_clip_norm: float = 1.0,
     ):
         self.encoder = encoder.to(device)
         self.projector = projector.to(device)
@@ -54,7 +55,12 @@ class CLOCSTrainer:
         self.lead_group_b = lead_group_b or [6, 7, 8, 9, 10, 11]
         self.use_amp = use_amp
         self.device = device
+        self.grad_clip_norm = grad_clip_norm
         self.scaler = torch.amp.GradScaler('cuda') if use_amp else None
+
+        # Cache for collapse metrics
+        self._last_z1 = None
+        self._last_z2 = None
 
     def _temporal_loss(self, batch: torch.Tensor) -> torch.Tensor:
         """
@@ -75,6 +81,10 @@ class CLOCSTrainer:
         h2 = self.encoder(seg2)
         z1 = self.projector(h1)
         z2 = self.projector(h2)
+
+        # Cache for collapse metrics
+        self._last_z1 = z1.detach()
+        self._last_z2 = z2.detach()
 
         return nt_xent_loss(z1, z2, self.temperature)
 
@@ -180,10 +190,19 @@ class CLOCSTrainer:
 
         if self.scaler:
             self.scaler.scale(loss_total).backward()
+            self.scaler.unscale_(self.optimizer)
+            nn.utils.clip_grad_norm_(
+                list(self.encoder.parameters()) + list(self.projector.parameters()),
+                self.grad_clip_norm,
+            )
             self.scaler.step(self.optimizer)
             self.scaler.update()
         else:
             loss_total.backward()
+            nn.utils.clip_grad_norm_(
+                list(self.encoder.parameters()) + list(self.projector.parameters()),
+                self.grad_clip_norm,
+            )
             self.optimizer.step()
 
         return {
@@ -192,3 +211,28 @@ class CLOCSTrainer:
             'spatial': loss_s.item(),
             'patient': loss_p_val,
         }
+
+    @torch.no_grad()
+    def compute_collapse_metrics(self) -> Dict[str, float]:
+        """
+        Compute representation collapse diagnostics from the last temporal batch.
+
+        Returns
+        -------
+        metrics : dict
+            - embed_std: mean std-dev across embedding dimensions (collapse → 0)
+            - avg_cosine_sim: mean pairwise cosine similarity of negatives (collapse → 1.0)
+        """
+        if self._last_z1 is None or self._last_z2 is None:
+            return {'embed_std': float('nan'), 'avg_cosine_sim': float('nan')}
+
+        z = torch.cat([self._last_z1, self._last_z2], dim=0).float()
+        embed_std = z.std(dim=0).mean().item()
+
+        z_norm = F.normalize(z, dim=1)
+        sim_matrix = torch.mm(z_norm, z_norm.t())
+        n = z.shape[0]
+        mask = ~torch.eye(n, device=z.device).bool()
+        avg_cosine_sim = sim_matrix[mask].mean().item()
+
+        return {'embed_std': embed_std, 'avg_cosine_sim': avg_cosine_sim}

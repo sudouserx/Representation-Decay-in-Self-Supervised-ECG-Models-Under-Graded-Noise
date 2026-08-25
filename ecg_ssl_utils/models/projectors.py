@@ -6,6 +6,21 @@ import torch
 import torch.nn as nn
 
 
+class Float32BatchNorm1d(nn.BatchNorm1d):
+    """
+    BatchNorm1d that forces float32 computation for AMP safety.
+
+    Under mixed-precision training, BatchNorm running statistics can
+    accumulate in float16, leading to variance underflow and representation
+    collapse. This wrapper forces the forward pass to run in float32 while
+    preserving the original dtype for downstream compatibility.
+    """
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dtype = x.dtype
+        x = super().forward(x.float())
+        return x.to(dtype)
+
+
 class MLPProjector(nn.Module):
     """
     2-layer MLP projection head (used by SimCLR, CLOCS, SwAV).
@@ -42,7 +57,7 @@ class MLPPredictor(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
+            Float32BatchNorm1d(hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, out_dim),
         )
@@ -61,7 +76,7 @@ class BYOLProjector(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
+            Float32BatchNorm1d(hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, out_dim),
         )

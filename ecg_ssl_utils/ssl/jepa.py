@@ -107,7 +107,7 @@ class JEPAModel(nn.Module):
 class JEPATrainer:
     def __init__(self, model, optimizer, scheduler=None,
                  ema_start=0.996, ema_end=1.0, total_epochs=200,
-                 use_amp=True, device='cuda'):
+                 use_amp=True, device='cuda', grad_clip_norm=1.0):
         self.model = model.to(device)
         self.opt = optimizer
         self.sched = scheduler
@@ -116,6 +116,7 @@ class JEPATrainer:
         self.total_epochs = total_epochs
         self.amp = use_amp
         self.dev = device
+        self.grad_clip_norm = grad_clip_norm
         self.scaler = torch.amp.GradScaler('cuda') if use_amp else None
 
     def get_ema_momentum(self, epoch):
@@ -128,12 +129,17 @@ class JEPATrainer:
         self.opt.zero_grad()
         with torch.amp.autocast('cuda', enabled=self.amp):
             loss = self.model(batch)
+        _params = (list(self.model.context_encoder.parameters()) +
+                   list(self.model.predictor.parameters()))
         if self.scaler:
             self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.opt)
+            nn.utils.clip_grad_norm_(_params, self.grad_clip_norm)
             self.scaler.step(self.opt)
             self.scaler.update()
         else:
             loss.backward()
+            nn.utils.clip_grad_norm_(_params, self.grad_clip_norm)
             self.opt.step()
         m = self.get_ema_momentum(epoch)
         self.model.update_target(m)

@@ -23,7 +23,7 @@ class SwAVTrainer:
     def __init__(self, encoder, projector, prototypes, augmentation,
                  optimizer, scheduler=None, temperature=0.1,
                  sinkhorn_iters=3, sinkhorn_eps=0.05,
-                 use_amp=True, device='cuda'):
+                 use_amp=True, device='cuda', grad_clip_norm=1.0):
         self.encoder = encoder.to(device)
         self.projector = projector.to(device)
         self.prototypes = prototypes.to(device)
@@ -35,6 +35,7 @@ class SwAVTrainer:
         self.sk_eps = sinkhorn_eps
         self.amp = use_amp
         self.dev = device
+        self.grad_clip_norm = grad_clip_norm
         self.scaler = torch.amp.GradScaler('cuda') if use_amp else None
 
     def _swav_loss(self, z1, z2):
@@ -63,12 +64,19 @@ class SwAVTrainer:
             z1 = self.projector(self.encoder(v1))
             z2 = self.projector(self.encoder(v2))
             loss = self._swav_loss(z1, z2)
+        _params = (list(self.encoder.parameters()) +
+                   list(self.projector.parameters()) +
+                   list(self.prototypes.parameters()))
         if self.scaler:
             self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.opt)
+            nn.utils.clip_grad_norm_(_params, self.grad_clip_norm)
             self.scaler.step(self.opt)
             self.scaler.update()
         else:
-            loss.backward(); self.opt.step()
+            loss.backward()
+            nn.utils.clip_grad_norm_(_params, self.grad_clip_norm)
+            self.opt.step()
         # Normalize prototypes
         with torch.no_grad():
             w = self.prototypes.prototypes.weight.data
