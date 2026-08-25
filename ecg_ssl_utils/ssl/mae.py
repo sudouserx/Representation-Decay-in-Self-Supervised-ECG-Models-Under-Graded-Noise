@@ -31,7 +31,7 @@ class MAEDecoder(nn.Module):
         B = enc_vis.shape[0]
         x = self.embed(enc_vis)
         mt = self.mask_token.expand(B, mask_ids.shape[1], -1)
-        full = torch.zeros(B, n_patches, self.dec_dim, device=x.device)
+        full = torch.zeros(B, n_patches, self.dec_dim, device=x.device, dtype=x.dtype)
         vi = vis_ids.unsqueeze(-1).expand(-1,-1,self.dec_dim)
         mi = mask_ids.unsqueeze(-1).expand(-1,-1,self.dec_dim)
         full.scatter_(1, vi, x)
