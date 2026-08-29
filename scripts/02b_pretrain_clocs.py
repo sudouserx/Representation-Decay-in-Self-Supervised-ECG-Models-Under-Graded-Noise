@@ -46,7 +46,7 @@ def main():
 
     # CLOCS runs the encoder 6× per batch (2× temporal + 2× spatial + 2× patient),
     # requiring ~3× SimCLR's GPU memory. Override batch_size to avoid T4 OOM.
-    clocs_batch_size = min(cfg.ssl_training.batch_size, 64)
+    clocs_batch_size = min(cfg.ssl_training.batch_size, 128)
 
     dataset = TensorDataset(torch.tensor(signals, dtype=torch.float32), patient_ids)
     loader = DataLoader(dataset, batch_size=clocs_batch_size,
