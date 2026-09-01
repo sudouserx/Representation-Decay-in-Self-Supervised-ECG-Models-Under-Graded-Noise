@@ -78,6 +78,7 @@ This pipeline is highly optimized for Kaggle T4 GPUs (16GB VRAM, <12 hour limit)
 - **Dataset**: PTB-XL, using canonical patient-level split (Train: 1-8, Val: 9, Test: 10).
 - **Preprocessing**: Bandpass filtering (0.5–45 Hz) and per-lead z-score normalization.
 - **Noise Injection**: We use an SNR-scaled injection formula combining MIT-BIH NSTDB records (Baseline Wander, Muscle Artifact, Electrode Motion) and synthetic models (50Hz Powerline, Electrode Pop, Inverter Switching). Injection is done on-the-fly deterministically to avoid saving massive `.npy` arrays.
+  This results in exactly **162 corruption conditions per encoder**: 6 noise types × 6 SNR levels × 3 seeds + 3 mixed-noise configs × 6 SNR levels × 3 seeds.
 
 ### SSL Pretraining Setup
 All SSL models share a backbone (except one sensitivity arm):
@@ -86,7 +87,7 @@ All SSL models share a backbone (except one sensitivity arm):
 - **Augmentations**: Random crop, temporal jitter, amplitude scaling, Gaussian noise, lead dropout, temporal masking.
 
 ### Representation Decay Metrics (Script 05)
-Evaluates how representations and tasks decay under the 1,134 evaluated noise conditions:
+Evaluates how representations and tasks decay under the 162 evaluated noise conditions per encoder:
 1. **Linear CKA (Centered Kernel Alignment)**: Measures representation geometry similarity between clean and noisy outputs.
 2. **Effective Rank (Spectral Entropy)**: Measures dimensionality retention / representational collapse.
 3. **Expected Calibration Error (ECE)**: Measures predictive calibration trustworthiness.
@@ -100,11 +101,17 @@ Profiles hardware efficiency using ONNX export and onnxruntime:
 - Execution Providers: CPU and CUDA.
 - Latency (p50/p95), peak memory tracing, throughput, and estimated energy consumption.
 
-### Deployment Safety Score (DSS)
-The DSS scalar is computed with the following non-compensatory gates:
-$$DSS = \alpha(1-\Delta CKA\_n) + \beta(1-\Delta ER\_n) + \gamma(1-ECE\_n) + \delta(1-Latency\_n)$$
-If `ECE` or `AUROC` fall below safety threshold gates, the model receives `DSS = 0.0`.
+### Robustness Score
+The scalar Robustness Score is computed with the following non-compensatory gates:
+$$Robustness = \alpha(1-\Delta CKA\_n) + \beta(1-\Delta ER\_n) + \gamma(1-\Delta ECE\_n) + \delta(1-\Delta AUROC\_n)$$
+If raw `ECE` or `AUROC` fall below safety threshold gates, the model receives a score of `0.0`.
 We perform a **Sobol sensitivity analysis** to test ranking stability across weight configurations.
+
+### Decision-Support Engine
+Deployment cost (latency, memory) is NOT a component of the robustness score. Instead, it acts as a constraint filter in the **Decision-Support Engine**. The engine takes the robustness score, Sobol stability, and deployment profile to generate:
+- **R1**: Model Recommendations (High Confidence vs. Qualified)
+- **R2**: Configuration Guidelines (Rule-derived matching of constraints to feasible models)
+- **R3**: Per-Noise-Type Risk Reports
 
 ## Open Design Decisions
 
@@ -113,7 +120,7 @@ All decisions are configurable via `ecg_ssl_utils/config.py`:
 - **ECG preprocessing filter**: 0.5–45 Hz Butterworth. Removes baseline wander and powerline noise while preserving QRS.
 - **MAE mask ratio**: 75% following canonical standards.
 - **JEPA EMA momentum**: 0.996 → 1.0 (cosine schedule).
-- **DSS normalization**: Reference-anchored min-max for interpretability on the 0-1 range.
+- **DSS normalization**: Reference-anchored min-max for interpretability on the 0-1 range. (Valid for within-experiment ranking).
 - **Bootstrap samples**: 1000 for 95% CI.
 
 ## Risk Mitigations
@@ -136,4 +143,4 @@ All decisions are configurable via `ecg_ssl_utils/config.py`:
 | Effective Rank | $\exp(-\sum \bar{\sigma}\_i \ln(\bar{\sigma}\_i))$ | Roy & Vetterli, 2007 |
 | ECE | $\sum (\vert B\_m\vert/n) \cdot \vert acc(B\_m) - conf(B\_m)\vert$ | Guo et al., ICML 2017 |
 | DeLong Test Z-stat | $\frac{\hat{\theta}\_A - \hat{\theta}\_B}{\sqrt{\mathrm{Var}(\hat{\theta}\_A) + \mathrm{Var}(\hat{\theta}\_B) - 2\mathrm{Cov}(\hat{\theta}\_A, \hat{\theta}\_B)}}$ | DeLong et al., Biometrics 1988 |
-| DSS | $\alpha(1-\Delta CKA\_n) + \dots + \delta(1-Latency\_n)$ | DSS Proposal (This project) |
+| Robustness Score | $\alpha(1-\Delta CKA\_n) + \dots + \delta(1-\Delta AUROC\_n)$ | Proposed Metric |

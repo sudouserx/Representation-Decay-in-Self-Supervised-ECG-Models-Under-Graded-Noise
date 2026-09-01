@@ -13,10 +13,15 @@ class DeploymentProfile:
     latency_p50: float
     latency_p95: float
     memory_mb: float
-    energy_per_inference: float
+    estimated_energy_j: float
     throughput: float
     model_size_mb: float
     device_name: str
+    batch_size: int
+    input_shape: str
+    warmup_runs: int
+    benchmark_runs: int
+    measurement_notes: str
 
 
 def profile_model(model_path, model_id, precision, provider='CPUExecutionProvider',
@@ -56,6 +61,9 @@ def profile_model(model_path, model_id, precision, provider='CPUExecutionProvide
     return DeploymentProfile(
         model_id=model_id, precision=precision, provider=provider,
         latency_p50=p50, latency_p95=p95, memory_mb=peak/1e6,
-        energy_per_inference=energy, throughput=throughput,
+        estimated_energy_j=energy, throughput=throughput,
         model_size_mb=size_mb, device_name=provider,
+        batch_size=1, input_shape=str(dummy.shape),
+        warmup_runs=warmup, benchmark_runs=n_runs,
+        measurement_notes="Energy is software-estimated (latency * assumed power draw). Not measured."
     )

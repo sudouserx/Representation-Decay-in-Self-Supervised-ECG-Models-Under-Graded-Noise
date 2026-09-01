@@ -11,7 +11,7 @@ def sobol_sensitivity(eval_fn, n_samples=1024, seed=42):
     Returns {weight_name: sensitivity_index}.
     """
     rng = np.random.RandomState(seed)
-    names = ['cka', 'erank', 'ece', 'latency']
+    names = ['cka', 'erank', 'ece', 'auroc_decay']
 
     # Sample from Dirichlet (uniform on 4-simplex)
     samples = rng.dirichlet(np.ones(4), size=n_samples)

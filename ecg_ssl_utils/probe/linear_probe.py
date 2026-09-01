@@ -24,7 +24,7 @@ def train_probe(representations, labels, val_repr, val_labels,
                 lr=1e-2, patience=10, device='cuda'):
     """Train linear probe on frozen representations. Returns probe + metrics."""
     probe = LinearProbe(in_dim, n_classes).to(device)
-    opt = torch.optim.AdamW(probe.parameters(), lr=lr)
+    opt = torch.optim.Adam(probe.parameters(), lr=lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, epochs)
     criterion = nn.BCEWithLogitsLoss()
 

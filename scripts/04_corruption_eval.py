@@ -7,7 +7,7 @@ Evaluate frozen encoders + linear probes on dynamically injected noisy ECGs.
 Kaggle Inputs: ptbxl-clean-processed, noisy-ecg-bank, ssl-* models, linear-probes-all
 Kaggle Output: /kaggle/working/corruption-eval-results/
 """
-import os, sys, json
+import os, sys, json, hashlib
 import numpy as np, pandas as pd, torch
 
 CLEAN_DIR = os.environ.get('CLEAN_DIR', '/kaggle/input/ptbxl-clean-processed')
@@ -37,7 +37,7 @@ def load_noise_bank():
             bank[f[:-4]] = np.load(os.path.join(templates_dir, f))
     return bank
 
-def load_pipeline(m_name, m_dir, cfg, device):
+def load_pipeline(m_name, m_dir, cfg, device, probe_n_classes=5):
     with open(os.path.join(m_dir, 'config.json')) as f:
         m_cfg = json.load(f)
     if m_cfg['backbone'] == 'vit_small_1d':
@@ -51,11 +51,20 @@ def load_pipeline(m_name, m_dir, cfg, device):
     
     # Load probe
     probe_path = os.path.join(PROBE_DIR, m_name, 'probe.pt')
-    probe = LinearProbe(cfg.backbone.embed_dim, cfg.data.n_classes)
+    probe = LinearProbe(cfg.backbone.embed_dim, probe_n_classes)
     probe.load_state_dict(torch.load(probe_path, map_location=device))
+    # Explicitly enforce eval mode
+    encoder.eval().to(device)
     probe.eval().to(device)
     
     return encoder, probe
+
+def hash_parameters(model):
+    """Compute a checksum of model parameters to ensure they are frozen."""
+    h = hashlib.sha256()
+    for p in model.parameters():
+        h.update(p.data.cpu().numpy().tobytes())
+    return h.hexdigest()
 
 def process_condition(clean_signals, manifest_subset, noise_bank, encoder, probe, device, batch_size=256):
     N = len(clean_signals)
@@ -97,9 +106,20 @@ def main():
     # Group by noise condition
     conditions = manifest.groupby(['noise_type', 'snr_db', 'seed'])
     
+    # Load probe metrics to get n_classes for each probe
+    probe_metrics_path = os.path.join(PROBE_DIR, 'probe_metrics.json')
+    if os.path.exists(probe_metrics_path):
+        with open(probe_metrics_path, 'r') as f:
+            probe_metrics = json.load(f)
+    else:
+        probe_metrics = {}
+    
     for m_name, m_dir in models.items():
         print(f"\nEvaluating {m_name}")
-        encoder, probe = load_pipeline(m_name, m_dir, cfg, device)
+        probe_info = probe_metrics.get(m_name, {})
+        probe_n_classes = probe_info.get('n_classes', cfg.data.n_superclasses)
+        
+        encoder, probe = load_pipeline(m_name, m_dir, cfg, device, probe_n_classes)
         m_out_dir = os.path.join(OUTPUT_DIR, m_name)
         os.makedirs(m_out_dir, exist_ok=True)
         
@@ -109,7 +129,15 @@ def main():
             # Ensure group matches test_signals order exactly
             assert len(group) == len(test_signals)
             
+            # Methodological assertion: ensure parameters are not mutated
+            enc_hash_before = hash_parameters(encoder)
+            probe_hash_before = hash_parameters(probe)
+            
+            # Determinism spot-check (only for the first batch/condition if we wanted, but we'll just run process_condition)
             reps, probs = process_condition(test_signals, group, noise_bank, encoder, probe, device)
+            
+            assert enc_hash_before == hash_parameters(encoder), "Encoder weights were mutated during evaluation!"
+            assert probe_hash_before == hash_parameters(probe), "Probe weights were mutated during evaluation!"
             
             cond_dir = os.path.join(m_out_dir, f"{ntype}_{snr}db_{seed}")
             os.makedirs(cond_dir, exist_ok=True)

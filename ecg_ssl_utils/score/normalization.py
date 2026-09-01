@@ -1,4 +1,12 @@
-"""Reference-anchored min-max normalization."""
+"""
+Reference-anchored min-max normalization.
+
+METHODOLOGY NOTE:
+Global min-max normalization is anchored to the observed worst/best case in the 
+current experimental grid. If a future run contains different corruption extremes, 
+all normalized scores will shift. This transformation is valid for within-experiment 
+ranking, but limits absolute comparability across independent studies.
+"""
 import numpy as np
 
 

@@ -28,7 +28,8 @@ from ecg_ssl_utils.data.preprocessing import (
     bandpass_filter, compute_norm_stats, normalize_signals, save_norm_stats
 )
 from ecg_ssl_utils.data.label_encoder import (
-    encode_scp_labels, get_label_map, save_label_map
+    encode_scp_labels, get_label_map, save_label_map,
+    encode_superclass_labels, SUPERCLASS_NAMES,
 )
 
 
@@ -99,6 +100,22 @@ def main():
     print(f"  Labels shape: {labels.shape}")
     print(f"  Avg labels per sample: {labels.sum(axis=1).mean():.2f}")
 
+    # 6b. Encode superclass labels (5-class: NORM, MI, STTC, CD, HYP)
+    print("\n" + "=" * 60)
+    print("STEP 5b: Encoding superclass labels")
+    print("=" * 60)
+    scp_statements_path = os.path.join(PTBXL_DIR, 'scp_statements.csv')
+    if os.path.exists(scp_statements_path):
+        superclass_labels = encode_superclass_labels(metadata, scp_statements_path)
+        print(f"  Superclass names: {SUPERCLASS_NAMES}")
+        print(f"  Superclass labels shape: {superclass_labels.shape}")
+        for i, name in enumerate(SUPERCLASS_NAMES):
+            print(f"    {name}: {int(superclass_labels[:, i].sum())} positive")
+    else:
+        print(f"  WARNING: scp_statements.csv not found at {scp_statements_path}")
+        print(f"  Superclass labels will not be generated.")
+        superclass_labels = None
+
     # 7. Save everything
     print("\n" + "=" * 60)
     print("STEP 6: Saving artifacts")
@@ -107,7 +124,11 @@ def main():
     for split_name, idx in splits.items():
         np.save(os.path.join(OUTPUT_DIR, f'signals_{split_name}.npy'), signals[idx])
         np.save(os.path.join(OUTPUT_DIR, f'labels_{split_name}.npy'), labels[idx])
-        print(f"  {split_name}: signals {signals[idx].shape}, labels {labels[idx].shape}")
+        if superclass_labels is not None:
+            np.save(os.path.join(OUTPUT_DIR, f'superclass_labels_{split_name}.npy'),
+                    superclass_labels[idx])
+        print(f"  {split_name}: signals {signals[idx].shape}, labels {labels[idx].shape}"
+              + (f", superclass {superclass_labels[idx].shape}" if superclass_labels is not None else ""))
 
     # Metadata
     metadata.to_parquet(os.path.join(OUTPUT_DIR, 'metadata.parquet'), index=False)

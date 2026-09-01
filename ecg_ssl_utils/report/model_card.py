@@ -24,10 +24,11 @@ def generate_model_card(model_info, save_path):
 - **FP32 Latency (p50)**: {model_info.get('latency_fp32', 'N/A'):.4f} s
 - **INT8 Latency (p50)**: {model_info.get('latency_int8', 'N/A'):.4f} s
 - **Model Size (FP32)**: {model_info.get('size_fp32', 'N/A'):.1f} MB
+- **Estimated Energy**: {model_info.get('estimated_energy_j', 'N/A'):.4f} J
 
-## DSS Score
-- **DSS (equal weights)**: {model_info.get('dss', 'N/A'):.4f}
-- **95% CI**: [{model_info.get('dss_ci_lo', 'N/A'):.4f}, {model_info.get('dss_ci_hi', 'N/A'):.4f}]
+## Robustness Score
+- **Robustness Score (equal weights)**: {model_info.get('robustness_score', 'N/A'):.4f}
+- **95% CI**: [{model_info.get('robustness_score_ci_lo', 'N/A'):.4f}, {model_info.get('robustness_score_ci_hi', 'N/A'):.4f}]
 
 ## Limitations
 - Evaluated on PTB-XL only (single-center German cohort)

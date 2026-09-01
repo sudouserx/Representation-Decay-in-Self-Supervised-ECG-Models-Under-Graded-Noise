@@ -17,7 +17,7 @@ def generate_leaderboard(dss_df, deploy_df, save_path='leaderboard.html',
     if max_ece:
         merged = merged[merged['ece'] <= max_ece]
 
-    merged = merged.sort_values('dss', ascending=False)
+    merged = merged.sort_values('robustness_score', ascending=False)
 
     html = '<html><head><style>'
     html += 'table{border-collapse:collapse;width:100%;font-family:sans-serif;}'

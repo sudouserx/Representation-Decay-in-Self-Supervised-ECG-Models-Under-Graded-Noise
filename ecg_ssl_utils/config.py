@@ -16,7 +16,11 @@ class DataConfig:
     sampling_rate: int = 500
     signal_length: int = 5000           # 10 s × 500 Hz
     n_leads: int = 12
-    n_classes: int = 71                 # SCP-ECG diagnostic codes
+    n_classes: int = 71                 # SCP-ECG diagnostic codes (fine-grained)
+    n_superclasses: int = 5             # Diagnostic superclasses (primary eval target)
+    superclass_names: List[str] = field(default_factory=lambda: [
+        'NORM', 'MI', 'STTC', 'CD', 'HYP'
+    ])
     lead_names: List[str] = field(default_factory=lambda: [
         'I', 'II', 'III', 'aVR', 'aVL', 'aVF',
         'V1', 'V2', 'V3', 'V4', 'V5', 'V6'
@@ -36,6 +40,9 @@ class DataConfig:
 class NoiseConfig:
     """Noise injection pipeline settings."""
     snr_grid: List[float] = field(default_factory=lambda: [24, 18, 12, 6, 0, -6])
+    # Seeds control noise injection determinism ONLY.
+    # Each corruption condition is realized 3 times using these seeds.
+    # SSL pretraining runs once per paradigm (not repeated).
     seeds: List[int] = field(default_factory=lambda: [42, 123, 456])
     noise_types_single: List[str] = field(default_factory=lambda: [
         'bw', 'ma', 'em', 'powerline', 'electrode_pop', 'inverter'
@@ -218,9 +225,9 @@ class DeployConfig:
 # ──────────────────────────────────────────────────────────────
 @dataclass
 class DSSConfig:
-    """Deployment Safety Score settings."""
+    """Robustness Score settings (formerly Deployment Safety Score)."""
     weights: Dict[str, float] = field(default_factory=lambda: {
-        'cka': 0.25, 'erank': 0.25, 'ece': 0.25, 'latency': 0.25
+        'cka': 0.25, 'erank': 0.25, 'ece': 0.25, 'auroc_decay': 0.25
     })
     ece_gate: float = 0.15              # non-compensatory safety gate
     auroc_gate: float = 0.70

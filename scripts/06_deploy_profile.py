@@ -7,7 +7,7 @@ Export models to ONNX and profile FP32 and INT8 performance.
 Kaggle Inputs: ssl-* models
 Kaggle Output: /kaggle/working/deployment-profiles/
 """
-import os, sys, glob, pandas as pd
+import os, sys, glob, pandas as pd, numpy as np
 from dataclasses import asdict
 
 UTILS_DIR = os.environ.get('UTILS_DIR', '/kaggle/input/ecg-ssl-utils')
@@ -41,6 +41,18 @@ def main():
     
     model_dirs = glob.glob('/kaggle/input/ssl-*') + glob.glob('/kaggle/working/ssl-*')
     unique_models = {os.path.basename(d): d for d in model_dirs if os.path.exists(os.path.join(d, 'encoder.pt'))}
+
+    # Load calibration data for static quantization (clean test signals)
+    clean_dir = os.environ.get('CLEAN_DIR', '/kaggle/input/ptbxl-clean-processed')
+    calib_path = os.path.join(clean_dir, 'signals_test.npy')
+    if os.path.exists(calib_path):
+        calib_signals = np.load(calib_path)[:cfg.deploy.calibration_samples]
+        # Static quant needs individual samples as list of (1, 12, 5000) arrays
+        calib_data = [calib_signals[i:i+1].astype(np.float32) for i in range(len(calib_signals))]
+        print(f"Loaded {len(calib_data)} calibration samples for static quantization")
+    else:
+        calib_data = None
+        print("No calibration data found; static quantization will use random data")
     
     results = []
     
@@ -52,24 +64,29 @@ def main():
         fp32_path = os.path.join(OUTPUT_DIR, f"{m_name}_fp32.onnx")
         export_to_onnx(encoder, fp32_path, opset=cfg.deploy.opset_version)
         
-        # 2. Quantize Dynamic INT8
-        int8_path = os.path.join(OUTPUT_DIR, f"{m_name}_int8_dynamic.onnx")
-        quantize_model(fp32_path, int8_path, mode='int8_dynamic')
-        
-        # 3. Profile
-        for provider in cfg.deploy.providers:
+        # 2. Quantize all modes from config
+        quant_paths = {'fp32': fp32_path}
+        for mode in cfg.deploy.quantization_modes:
+            if mode == 'fp32':
+                continue  # already have the FP32 model
+            quant_path = os.path.join(OUTPUT_DIR, f"{m_name}_{mode}.onnx")
             try:
-                prof_fp32 = profile_model(fp32_path, m_name, 'fp32', provider,
-                                          warmup=cfg.deploy.warmup_runs, n_runs=cfg.deploy.benchmark_runs,
-                                          power_w=cfg.deploy.estimated_inference_power_w)
-                results.append(asdict(prof_fp32))
-                
-                prof_int8 = profile_model(int8_path, m_name, 'int8_dynamic', provider,
-                                          warmup=cfg.deploy.warmup_runs, n_runs=cfg.deploy.benchmark_runs,
-                                          power_w=cfg.deploy.estimated_inference_power_w)
-                results.append(asdict(prof_int8))
+                quantize_model(fp32_path, quant_path, mode=mode,
+                               calibration_data=calib_data)
+                quant_paths[mode] = quant_path
             except Exception as e:
-                print(f"Profiling failed for {m_name} on {provider}: {e}")
+                print(f"  Quantization ({mode}) failed for {m_name}: {e}")
+        
+        # 3. Profile all available models × providers
+        for precision, model_path in quant_paths.items():
+            for provider in cfg.deploy.providers:
+                try:
+                    prof = profile_model(model_path, m_name, precision, provider,
+                                          warmup=cfg.deploy.warmup_runs, n_runs=cfg.deploy.benchmark_runs,
+                                          power_w=cfg.deploy.estimated_inference_power_w)
+                    results.append(asdict(prof))
+                except Exception as e:
+                    print(f"  Profiling failed for {m_name}/{precision} on {provider}: {e}")
                 
     df = pd.DataFrame(results)
     df.to_parquet(os.path.join(OUTPUT_DIR, 'deployment_profiles.parquet'), index=False)

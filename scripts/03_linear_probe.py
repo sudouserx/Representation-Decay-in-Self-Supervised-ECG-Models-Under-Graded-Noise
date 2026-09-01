@@ -5,6 +5,8 @@ Script 03 — Linear Probe Training
 Train linear probe on clean representations from all frozen SSL encoders,
 and apply temperature scaling.
 
+Primary evaluation target: 5 diagnostic superclasses (NORM, MI, STTC, CD, HYP).
+
 Kaggle Inputs:  ptbxl-clean-processed, all ssl-* model outputs
 Kaggle Output:  /kaggle/working/linear-probes-all/
 """
@@ -47,6 +49,34 @@ def extract_features(encoder, signals, batch_size=256, device='cuda'):
     return np.vstack(features)
 
 
+def _load_labels(clean_dir):
+    """
+    Load labels for probe training.
+    Prefers superclass labels (5-class) per methodology.
+    Falls back to 71-class SCP labels if superclass files don't exist.
+    """
+    sc_train = os.path.join(clean_dir, 'superclass_labels_train.npy')
+    sc_val = os.path.join(clean_dir, 'superclass_labels_val.npy')
+    sc_test = os.path.join(clean_dir, 'superclass_labels_test.npy')
+
+    if os.path.exists(sc_train) and os.path.exists(sc_val):
+        labels_train = np.load(sc_train)
+        labels_val = np.load(sc_val)
+        labels_test = np.load(sc_test) if os.path.exists(sc_test) else None
+        n_classes = labels_train.shape[1]
+        label_type = 'superclass'
+        print(f"  Using superclass labels ({n_classes} classes)")
+    else:
+        labels_train = np.load(os.path.join(clean_dir, 'labels_train.npy'))
+        labels_val = np.load(os.path.join(clean_dir, 'labels_val.npy'))
+        labels_test = np.load(os.path.join(clean_dir, 'labels_test.npy'))
+        n_classes = labels_train.shape[1]
+        label_type = 'scp_codes'
+        print(f"  Superclass labels not found, falling back to SCP codes ({n_classes} classes)")
+
+    return labels_train, labels_val, labels_test, n_classes, label_type
+
+
 def main():
     cfg = get_config()
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -60,10 +90,10 @@ def main():
     unique_models = {os.path.basename(d): d for d in model_dirs}
     
     signals_train = np.load(os.path.join(CLEAN_DIR, 'signals_train.npy'))
-    labels_train = np.load(os.path.join(CLEAN_DIR, 'labels_train.npy'))
     signals_val = np.load(os.path.join(CLEAN_DIR, 'signals_val.npy'))
-    labels_val = np.load(os.path.join(CLEAN_DIR, 'labels_val.npy'))
     signals_test = np.load(os.path.join(CLEAN_DIR, 'signals_test.npy'))
+
+    labels_train, labels_val, labels_test, n_classes, label_type = _load_labels(CLEAN_DIR)
     
     results = {}
     
@@ -82,10 +112,10 @@ def main():
         np.save(os.path.join(m_out_dir, 'clean_train_repr.npy'), train_feat)
         np.save(os.path.join(m_out_dir, 'clean_test_repr.npy'), test_feat)
         
-        # 2. Train probe
+        # 2. Train probe (on superclass labels by default)
         probe, val_auroc = train_probe(
             train_feat, labels_train, val_feat, labels_val,
-            in_dim=cfg.backbone.embed_dim, n_classes=labels_train.shape[1],
+            in_dim=cfg.backbone.embed_dim, n_classes=n_classes,
             epochs=cfg.probe.epochs, batch_size=cfg.probe.batch_size,
             lr=cfg.probe.lr, patience=cfg.probe.patience, device=device
         )
@@ -103,10 +133,21 @@ def main():
             val_probs = torch.sigmoid(torch.tensor(val_logits) / T).numpy()
         val_ece = expected_calibration_error(labels_val, val_probs, n_bins=cfg.probe.n_calibration_bins)
         print(f"  Calibrated Val ECE: {val_ece:.4f}")
+
+        # 4. Clean test predictions — required for paired evaluation
+        with torch.no_grad():
+            test_logits = probe(torch.tensor(test_feat, dtype=torch.float32).to(device)).cpu().numpy()
+            test_probs = torch.sigmoid(torch.tensor(test_logits) / T).numpy()
+        np.save(os.path.join(m_out_dir, 'clean_test_predictions.npy'), test_probs)
+        print(f"  Saved clean test predictions: {test_probs.shape}")
         
         # Save probe
         torch.save(probe.state_dict(), os.path.join(m_out_dir, 'probe.pt'))
-        results[m_name] = {'val_auroc': val_auroc, 'val_ece': val_ece, 'temperature': float(T)}
+        results[m_name] = {
+            'val_auroc': val_auroc, 'val_ece': val_ece,
+            'temperature': float(T), 'n_classes': n_classes,
+            'label_type': label_type,
+        }
         
     with open(os.path.join(OUTPUT_DIR, 'probe_metrics.json'), 'w') as f:
         json.dump(results, f, indent=2)

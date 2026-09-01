@@ -1,7 +1,9 @@
 """
 SCP-ECG label encoding for PTB-XL multi-label classification.
+Supports both 71 fine-grained SCP codes and 5 diagnostic superclasses.
 """
 
+import os
 import numpy as np
 import pandas as pd
 import json
@@ -17,6 +19,9 @@ SCP_SUPERCLASSES = {
     'CD': 'Conduction Disturbance',
     'HYP': 'Hypertrophy',
 }
+
+# Ordered superclass names for consistent indexing
+SUPERCLASS_NAMES: List[str] = ['NORM', 'MI', 'STTC', 'CD', 'HYP']
 
 
 def get_scp_code_list(metadata: pd.DataFrame) -> List[str]:
@@ -124,3 +129,48 @@ def get_superclass_mapping(scp_statements_path: str) -> Dict[str, str]:
             if pd.notna(superclass):
                 mapping[code] = superclass
     return mapping
+
+
+def encode_superclass_labels(
+    metadata: pd.DataFrame,
+    scp_statements_path: str,
+    threshold: float = 0.0,
+) -> np.ndarray:
+    """
+    Encode SCP codes as 5-class superclass multi-hot vectors.
+
+    Uses scp_statements.csv to map individual SCP codes to their
+    diagnostic superclass (NORM, MI, STTC, CD, HYP), then creates
+    a (N, 5) binary array.
+
+    Parameters
+    ----------
+    metadata : pd.DataFrame
+        Must have 'scp_codes' column with dict values {code: likelihood}.
+    scp_statements_path : str
+        Path to scp_statements.csv from PTB-XL dataset.
+    threshold : float
+        Minimum likelihood to include a label (PTB-XL uses 0-100 scale).
+        Default 0.0 includes all annotated codes.
+
+    Returns
+    -------
+    labels : np.ndarray
+        Shape (N, 5) multi-hot float32, columns ordered as SUPERCLASS_NAMES.
+    """
+    # Build code → superclass mapping
+    code_to_super = get_superclass_mapping(scp_statements_path)
+    super_to_idx = {name: i for i, name in enumerate(SUPERCLASS_NAMES)}
+
+    n_samples = len(metadata)
+    labels = np.zeros((n_samples, len(SUPERCLASS_NAMES)), dtype=np.float32)
+
+    for i, codes_dict in enumerate(metadata['scp_codes']):
+        if isinstance(codes_dict, dict):
+            for code, likelihood in codes_dict.items():
+                if code in code_to_super and likelihood > threshold:
+                    superclass = code_to_super[code]
+                    if superclass in super_to_idx:
+                        labels[i, super_to_idx[superclass]] = 1.0
+
+    return labels

@@ -26,15 +26,14 @@ def prepare_radar_data(dss_results_df):
         values = [
             1.0 - row.get('delta_cka', 0.0),      # CKA retention
             1.0 - row.get('delta_erank', 0.0),    # Dimensionality retention
-            1.0 - row.get('ece', 0.0),            # Calibration
+            1.0 - row.get('delta_ece', 0.0),      # Calibration retention
             row.get('auroc', 0.5),                # Task performance
-            1.0 - row.get('latency_norm', 0.0)    # Speed
         ]
         
         if model not in radar_data:
             radar_data[model] = {}
         radar_data[model][condition] = values
         
-    axis_labels = ['Representation (CKA)', 'Dimensionality (ER)', 'Calibration (1-ECE)', 'Task (AUROC)', 'Speed (1-Lat)']
+    axis_labels = ['Representation (CKA)', 'Dimensionality (ER)', 'Calibration (1-ΔECE)', 'Task (AUROC)']
     
     return radar_data, axis_labels
