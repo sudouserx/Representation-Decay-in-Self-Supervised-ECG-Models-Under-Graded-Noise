@@ -106,9 +106,9 @@ class SimCLRTrainer:
         self.grad_accum_steps = grad_accum_steps
         self.scaler = torch.amp.GradScaler('cuda') if use_amp else None
 
-        # Cache for collapse metrics (populated by compute_collapse_metrics)
-        self._last_z1 = None
-        self._last_z2 = None
+        # Running buffer of recent projections (not only the last batch)
+        self._z_buffer = []
+        self._z_buffer_max = 8
 
     def train_step(self, batch: torch.Tensor, step_idx: int = 0) -> float:
         """
@@ -151,9 +151,9 @@ class SimCLRTrainer:
             loss = nt_xent_loss(z1, z2, self.temperature)
             loss_scaled = loss / self.grad_accum_steps
 
-        # Cache projections for collapse metrics (detached)
-        self._last_z1 = z1.detach()
-        self._last_z2 = z2.detach()
+        self._z_buffer.append(torch.cat([z1.detach(), z2.detach()], dim=0).cpu())
+        if len(self._z_buffer) > self._z_buffer_max:
+            self._z_buffer.pop(0)
 
         if self.scaler:
             self.scaler.scale(loss_scaled).backward()
@@ -188,19 +188,18 @@ class SimCLRTrainer:
             - embed_std: mean std-dev across embedding dimensions (collapse → 0)
             - avg_cosine_sim: mean pairwise cosine similarity of negatives (collapse → 1.0)
         """
-        if self._last_z1 is None or self._last_z2 is None:
+        if not self._z_buffer:
             return {'embed_std': float('nan'), 'avg_cosine_sim': float('nan')}
 
-        z = torch.cat([self._last_z1, self._last_z2], dim=0).float()  # (2B, D)
+        z = torch.cat(self._z_buffer, dim=0).float()
 
         # 1. Embedding std: mean of per-dimension std across the batch
         embed_std = z.std(dim=0).mean().item()
 
         # 2. Average cosine similarity of all pairs (excluding self)
         z_norm = F.normalize(z, dim=1)
-        sim_matrix = torch.mm(z_norm, z_norm.t())  # (2B, 2B)
-        B = self._last_z1.shape[0]
-        n = 2 * B
+        sim_matrix = torch.mm(z_norm, z_norm.t())
+        n = z.shape[0]
 
         # Mask out diagonal (self-similarity = 1.0)
         mask = ~torch.eye(n, device=z.device).bool()

@@ -30,15 +30,21 @@ class JEPAPredictor(nn.Module):
 
 
 class JEPAModel(nn.Module):
-    def __init__(self, encoder, predictor, ema_momentum=0.996):
+    """I-JEPA–adapted: target encoder sees target patches + CLS (not the full
+    sequence); loss is L2. Disclosed as an adaptation of Assran et al. 2023.
+    """
+    def __init__(self, encoder, predictor, ema_momentum=0.996,
+                 num_target_blocks=4, target_block_size_range=(10, 15)):
         super().__init__()
         self.context_encoder = encoder
         self.target_encoder = copy.deepcopy(encoder)
         self.predictor = predictor
         self.ema_m = ema_momentum
-        # Freeze target encoder
+        self.num_target_blocks = num_target_blocks
+        self.target_block_size_range = tuple(target_block_size_range)
         for p in self.target_encoder.parameters():
             p.requires_grad = False
+        self._last_ctx_repr = None
 
     @torch.no_grad()
     def update_target(self, m=None):
@@ -47,57 +53,79 @@ class JEPAModel(nn.Module):
                             self.context_encoder.parameters()):
             p_t.data.mul_(m).add_(p_c.data, alpha=1-m)
 
-    def _sample_blocks(self, N, n_blocks=4, block_range=(10,15), device='cuda'):
-        """Sample contiguous target blocks."""
-        tgt_ids = set()
-        for _ in range(n_blocks):
-            bsz = torch.randint(block_range[0], block_range[1]+1, (1,)).item()
-            start = torch.randint(0, max(1, N - bsz), (1,)).item()
-            for j in range(start, min(start+bsz, N)):
-                tgt_ids.add(j)
-        tgt_ids = sorted(tgt_ids)
-        ctx_ids = sorted(set(range(N)) - set(tgt_ids))
-        return (torch.tensor(ctx_ids, device=device),
-                torch.tensor(tgt_ids, device=device))
+    def _sample_blocks_batch(self, B, N, device):
+        """Per-sample contiguous target blocks with a shared token count.
+
+        Block size is fixed to the midpoint of *target_block_size_range* so
+        the batch can be gathered with advanced indexing.
+        """
+        lo, hi = self.target_block_size_range
+        bsz = max(1, (lo + hi) // 2)
+        n_blocks = self.num_target_blocks
+        max_start = max(1, N - bsz)
+        starts = torch.randint(0, max_start, (B, n_blocks), device=device)
+        offsets = torch.arange(bsz, device=device)[None, None, :]
+        tgt = (starts.unsqueeze(-1) + offsets).reshape(B, n_blocks * bsz)
+        tgt = tgt.clamp(0, N - 1)
+        # Context = complement via boolean mask
+        mask = torch.ones(B, N, dtype=torch.bool, device=device)
+        mask.scatter_(1, tgt, False)
+        n_ctx = int(mask.sum(dim=1).min().item())
+        ctx_ids = torch.stack([
+            mask[b].nonzero(as_tuple=False).squeeze(-1)[:n_ctx] for b in range(B)
+        ], dim=0)
+        n_tgt = n_blocks * bsz
+        tgt_ids = tgt[:, :n_tgt]
+        return ctx_ids, tgt_ids
 
     def forward(self, x):
         B, C, L = x.shape
         N = self.context_encoder.num_patches
         device = x.device
 
-        ctx_ids, tgt_ids = self._sample_blocks(N, device=device)
+        ctx_ids, tgt_ids = self._sample_blocks_batch(B, N, device)
 
         # Full patch tokens
         patches = self.context_encoder.patch_embed(x)  # (B,N,D)
 
-        # Context encoding
-        ctx = patches[:, ctx_ids, :]
+        # Context encoding (per-sample indices: (B, n_ctx))
+        ctx = torch.gather(patches, 1, ctx_ids.unsqueeze(-1).expand(-1, -1, patches.shape[-1]))
         cls = self.context_encoder.cls_token.expand(B,-1,-1)
         ctx = torch.cat([cls, ctx], 1)
-        cpos = self.context_encoder.pos_embed[:,:1,:]
-        vpos = self.context_encoder.pos_embed[:,1:,:][:,ctx_ids,:]
-        ctx = ctx + torch.cat([cpos.expand(B,-1,-1), vpos.expand(B,-1,-1)], 1)
+        cpos = self.context_encoder.pos_embed[:,:1,:].expand(B,-1,-1)
+        vpos = torch.gather(
+            self.context_encoder.pos_embed[:,1:,:].expand(B,-1,-1),
+            1, ctx_ids.unsqueeze(-1).expand(-1, -1, patches.shape[-1]),
+        )
+        ctx = ctx + torch.cat([cpos, vpos], 1)
         for blk in self.context_encoder.blocks:
             ctx = blk(ctx)
-        ctx = self.context_encoder.norm(ctx)[:,1:,:]  # remove CLS
+        ctx = self.context_encoder.norm(ctx)[:,1:,:]
+        self._last_ctx_repr = ctx.mean(dim=1).detach()
 
-        # Target encoding (no grad)
         with torch.no_grad():
-            tgt_patches = patches[:, tgt_ids, :]
+            tgt_patches = torch.gather(
+                patches, 1, tgt_ids.unsqueeze(-1).expand(-1, -1, patches.shape[-1]),
+            )
             cls_t = self.target_encoder.cls_token.expand(B,-1,-1)
             tgt_in = torch.cat([cls_t, tgt_patches], 1)
-            tpos = self.target_encoder.pos_embed[:,1:,:][:,tgt_ids,:]
+            tpos = torch.gather(
+                self.target_encoder.pos_embed[:,1:,:].expand(B,-1,-1),
+                1, tgt_ids.unsqueeze(-1).expand(-1, -1, patches.shape[-1]),
+            )
             tgt_in = tgt_in + torch.cat([
                 self.target_encoder.pos_embed[:,:1,:].expand(B,-1,-1),
-                tpos.expand(B,-1,-1)
+                tpos,
             ], 1)
             for blk in self.target_encoder.blocks:
                 tgt_in = blk(tgt_in)
-            s_y = self.target_encoder.norm(tgt_in)[:,1:,:]  # (B,n_tgt,D)
+            s_y = self.target_encoder.norm(tgt_in)[:,1:,:]
 
-        # Predictor: predict target embeddings from context
-        tgt_pos = self.context_encoder.pos_embed[:,1:,:][:,tgt_ids,:].expand(B,-1,-1)
-        s_y_hat = self.predictor(ctx, tgt_pos)  # (B,n_tgt,D)
+        tgt_pos = torch.gather(
+            self.context_encoder.pos_embed[:,1:,:].expand(B,-1,-1),
+            1, tgt_ids.unsqueeze(-1).expand(-1, -1, patches.shape[-1]),
+        )
+        s_y_hat = self.predictor(ctx, tgt_pos)
 
         # L2 loss
         loss = ((s_y_hat - s_y.detach())**2).mean()
@@ -107,7 +135,8 @@ class JEPAModel(nn.Module):
 class JEPATrainer:
     def __init__(self, model, optimizer, scheduler=None,
                  ema_start=0.996, ema_end=1.0, total_epochs=200,
-                 use_amp=True, device='cuda', grad_clip_norm=1.0):
+                 use_amp=True, device='cuda', grad_clip_norm=1.0,
+                 grad_accum_steps=1):
         self.model = model.to(device)
         self.opt = optimizer
         self.sched = scheduler
@@ -117,30 +146,65 @@ class JEPATrainer:
         self.amp = use_amp
         self.dev = device
         self.grad_clip_norm = grad_clip_norm
+        self.grad_accum_steps = grad_accum_steps
         self.scaler = torch.amp.GradScaler('cuda') if use_amp else None
 
     def get_ema_momentum(self, epoch):
         """Cosine EMA schedule: 0.996 → 1.0"""
         return 1 - (1 - self.ema_start) * 0.5 * (1 + math.cos(math.pi * epoch / self.total_epochs))
 
-    def train_step(self, batch, epoch=0):
+    def train_step(self, batch, epoch=0, step_idx=0):
         self.model.train()
         batch = batch.to(self.dev)
-        self.opt.zero_grad()
+        if step_idx % self.grad_accum_steps == 0:
+            self.opt.zero_grad()
         with torch.amp.autocast('cuda', enabled=self.amp):
             loss = self.model(batch)
+            loss_scaled = loss / self.grad_accum_steps
         _params = (list(self.model.context_encoder.parameters()) +
                    list(self.model.predictor.parameters()))
+        do_step = (step_idx + 1) % self.grad_accum_steps == 0
         if self.scaler:
-            self.scaler.scale(loss).backward()
-            self.scaler.unscale_(self.opt)
-            nn.utils.clip_grad_norm_(_params, self.grad_clip_norm)
-            self.scaler.step(self.opt)
-            self.scaler.update()
+            self.scaler.scale(loss_scaled).backward()
+            if do_step:
+                self.scaler.unscale_(self.opt)
+                nn.utils.clip_grad_norm_(_params, self.grad_clip_norm)
+                self.scaler.step(self.opt)
+                self.scaler.update()
         else:
-            loss.backward()
-            nn.utils.clip_grad_norm_(_params, self.grad_clip_norm)
-            self.opt.step()
-        m = self.get_ema_momentum(epoch)
-        self.model.update_target(m)
+            loss_scaled.backward()
+            if do_step:
+                nn.utils.clip_grad_norm_(_params, self.grad_clip_norm)
+                self.opt.step()
+        if do_step:
+            m = self.get_ema_momentum(epoch)
+            self.model.update_target(m)
         return loss.item()
+
+    @torch.no_grad()
+    def compute_collapse_metrics(self):
+        z = self.model._last_ctx_repr
+        if z is None:
+            return {'embed_std': float('nan'), 'avg_cosine_sim': float('nan'),
+                    'var_below_1e-4': 0, 'cov_abs_mean': float('nan')}
+        z = z.float()
+        std = z.std(dim=0).mean().item()
+        zn = torch.nn.functional.normalize(z, dim=1)
+        sim = zn @ zn.t()
+        n = z.shape[0]
+        mask = ~torch.eye(n, device=z.device).bool()
+        cos = sim[mask].mean().item()
+        var = z.var(dim=0)
+        if n > 1:
+            cov = torch.cov(z.T)
+            cov = cov.clone()
+            cov.fill_diagonal_(0)
+            cov_abs = cov.abs().mean().item()
+        else:
+            cov_abs = float('nan')
+        return {
+            'embed_std': std,
+            'avg_cosine_sim': cos,
+            'var_below_1e-4': int((var < 1e-4).sum().item()),
+            'cov_abs_mean': cov_abs,
+        }

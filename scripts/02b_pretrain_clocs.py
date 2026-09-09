@@ -1,27 +1,28 @@
 #!/usr/bin/env python3
 """
-Script 02b — Pretrain CLOCS
-==============================
-Temporal + Spatial + Patient contrastive learning on clean PTB-XL.
+Script 02b — Pretrain CLOCS-adapted
+===================================
+Temporal + spatial + patient contrastive learning (CLOCS-adapted:
+τ=0.5, interpolated temporal halves, Gaussian lead fill, first-2 patient
+pairs). Not a faithful reimplementation of Kiyasseh et al. 2021.
 
-Kaggle Inputs:  ptbxl-clean-processed, ecg-ssl-utils
-Kaggle Output:  /kaggle/working/ssl-clocs-vit-small/ → 'ssl-clocs-vit-small'
-Est. Runtime:   ~8-10 h (GPU T4)
+Kaggle Output:  /kaggle/working/ssl-clocs-vit-small-seed<seed>/
 """
 import os, sys, json, time
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import TensorDataset
 
 CLEAN_DIR = os.environ.get('CLEAN_DIR', '/kaggle/input/ptbxl-clean-processed')
 UTILS_DIR = os.environ.get('UTILS_DIR', '/kaggle/input/ecg-ssl-utils')
-OUTPUT_DIR = '/kaggle/working/ssl-clocs-vit-small'
 
 if UTILS_DIR not in sys.path: sys.path.insert(0, UTILS_DIR)
 
+from ecg_ssl_utils.artifact import write_artifact_snapshot
 from ecg_ssl_utils.config import get_config
-from ecg_ssl_utils.models.vit_small_1d import ViTSmall1D
 from ecg_ssl_utils.models.projectors import MLPProjector
+from ecg_ssl_utils.models.vit_small_1d import ViTSmall1D
+from ecg_ssl_utils.repro import make_deterministic_loader, parse_pretrain_seed, set_global_seed
 from ecg_ssl_utils.ssl.clocs import CLOCSTrainer
 import pandas as pd
 
@@ -34,9 +35,12 @@ COLLAPSE_PATIENCE = 5
 
 def main():
     cfg = get_config()
+    seed = parse_pretrain_seed(cfg.ssl_training.pretrain_seeds[0])
+    set_global_seed(seed)
+    OUTPUT_DIR = f'/kaggle/working/ssl-clocs-vit-small-seed{seed}'
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Device: {device}")
+    print(f"Device: {device} | seed: {seed}")
 
     signals = np.load(os.path.join(CLEAN_DIR, 'signals_train.npy'))
     meta = pd.read_parquet(os.path.join(CLEAN_DIR, 'metadata.parquet'))
@@ -47,11 +51,14 @@ def main():
     # CLOCS runs the encoder 6× per batch (2× temporal + 2× spatial + 2× patient),
     # requiring ~3× SimCLR's GPU memory. Override batch_size to avoid T4 OOM.
     clocs_batch_size = min(cfg.ssl_training.batch_size, 128)
+    # 128 × 8 = 1024 effective batch to approach SimCLR epoch-budget honesty
+    grad_accum_steps = max(1, (cfg.ssl_training.batch_size * cfg.ssl_training.grad_accum_steps) // clocs_batch_size)
 
     dataset = TensorDataset(torch.tensor(signals, dtype=torch.float32), patient_ids)
-    loader = DataLoader(dataset, batch_size=clocs_batch_size,
-                        shuffle=True, num_workers=cfg.ssl_training.num_workers,
-                        pin_memory=True, drop_last=True)
+    loader = make_deterministic_loader(
+        dataset, clocs_batch_size, seed,
+        workers=cfg.ssl_training.num_workers, pin_memory=True, drop_last=True,
+    )
 
     encoder = ViTSmall1D(patch_size=cfg.backbone.patch_size, embed_dim=cfg.backbone.embed_dim,
                          depth=cfg.backbone.depth, num_heads=cfg.backbone.num_heads)
@@ -96,7 +103,8 @@ def main():
                            lambda_spatial=cfg.clocs.lambda_spatial,
                            lambda_patient=cfg.clocs.lambda_patient,
                            use_amp=cfg.ssl_training.use_amp, device=device,
-                           grad_clip_norm=cfg.ssl_training.grad_clip_norm)
+                           grad_clip_norm=cfg.ssl_training.grad_clip_norm,
+                           grad_accum_steps=grad_accum_steps)
 
     log = open(os.path.join(OUTPUT_DIR, 'train_log.csv'),
                'a' if start_epoch > 0 else 'w')
@@ -105,7 +113,8 @@ def main():
                   'lr,time_s,embed_std,avg_cosine_sim\n')
 
     print(f"\nTraining CLOCS for {total_epochs} epochs")
-    print(f"  Batch size: {clocs_batch_size} (reduced from {cfg.ssl_training.batch_size} — 6 encoder fwd passes/step)")
+    print(f"  Batch size: {clocs_batch_size} × {grad_accum_steps} accum "
+          f"(CLOCS-adapted; 6 encoder fwd passes/step)")
     print(f"  Temperature: {cfg.clocs.temperature}")
     print(f"  Warmup: {warmup_epochs} epochs")
     print(f"  Grad clip norm: {cfg.ssl_training.grad_clip_norm}")
@@ -115,8 +124,8 @@ def main():
     for epoch in range(start_epoch, total_epochs):
         t0 = time.time()
         ep_losses = []
-        for batch_sig, batch_pid in loader:
-            losses = trainer.train_step(batch_sig, batch_pid)
+        for step_idx, (batch_sig, batch_pid) in enumerate(loader):
+            losses = trainer.train_step(batch_sig, batch_pid, step_idx=step_idx)
             ep_losses.append(losses)
         scheduler.step()
 
@@ -162,10 +171,13 @@ def main():
     log.close()
     torch.save(encoder.state_dict(), os.path.join(OUTPUT_DIR, 'encoder.pt'))
     with open(os.path.join(OUTPUT_DIR, 'config.json'), 'w') as f:
-        json.dump({'paradigm': 'clocs', 'backbone': 'vit_small_1d',
+        json.dump({'paradigm': 'clocs_adapted', 'backbone': 'vit_small_1d',
+                   'seed': seed, 'sensitivity_arm': False,
                    'epochs': total_epochs, 'temperature': cfg.clocs.temperature,
                    'warmup_epochs': warmup_epochs,
+                   'grad_accum_steps': grad_accum_steps,
                    'grad_clip_norm': cfg.ssl_training.grad_clip_norm}, f, indent=2)
+    write_artifact_snapshot(OUTPUT_DIR, cfg, seed=seed, filename='run_snapshot.json')
     print(f"\n✓ CLOCS pretraining complete! Saved to {OUTPUT_DIR}")
 
 

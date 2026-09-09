@@ -16,6 +16,7 @@ def sinkhorn(Q, niters=3, epsilon=0.05):
         for _ in range(niters):
             Q /= Q.sum(dim=1, keepdim=True) * K  # row norm
             Q /= Q.sum(dim=0, keepdim=True) * B  # col norm
+        Q *= B  # columns (samples) must sum to 1
     return Q.T  # (B, K)
 
 
@@ -23,7 +24,8 @@ class SwAVTrainer:
     def __init__(self, encoder, projector, prototypes, augmentation,
                  optimizer, scheduler=None, temperature=0.1,
                  sinkhorn_iters=3, sinkhorn_eps=0.05,
-                 use_amp=True, device='cuda', grad_clip_norm=1.0):
+                 use_amp=True, device='cuda', grad_clip_norm=1.0,
+                 grad_accum_steps=1):
         self.encoder = encoder.to(device)
         self.projector = projector.to(device)
         self.prototypes = prototypes.to(device)
@@ -36,7 +38,9 @@ class SwAVTrainer:
         self.amp = use_amp
         self.dev = device
         self.grad_clip_norm = grad_clip_norm
+        self.grad_accum_steps = grad_accum_steps
         self.scaler = torch.amp.GradScaler('cuda') if use_amp else None
+        self._last_z = None
 
     def _swav_loss(self, z1, z2):
         """Swapped prediction loss."""
@@ -55,30 +59,46 @@ class SwAVTrainer:
         loss = -0.5 * (q2 * p1 + q1 * p2).sum(dim=1).mean()
         return loss
 
-    def train_step(self, batch):
+    def train_step(self, batch, step_idx=0):
         self.encoder.train(); self.projector.train()
         batch = batch.to(self.dev)
         v1, v2 = self.augmentation(batch), self.augmentation(batch)
-        self.opt.zero_grad()
+        if step_idx % self.grad_accum_steps == 0:
+            self.opt.zero_grad()
         with torch.amp.autocast('cuda', enabled=self.amp):
             z1 = self.projector(self.encoder(v1))
             z2 = self.projector(self.encoder(v2))
             loss = self._swav_loss(z1, z2)
+            loss_scaled = loss / self.grad_accum_steps
+        self._last_z = torch.cat([z1.detach(), z2.detach()], dim=0)
         _params = (list(self.encoder.parameters()) +
                    list(self.projector.parameters()) +
                    list(self.prototypes.parameters()))
         if self.scaler:
-            self.scaler.scale(loss).backward()
-            self.scaler.unscale_(self.opt)
-            nn.utils.clip_grad_norm_(_params, self.grad_clip_norm)
-            self.scaler.step(self.opt)
-            self.scaler.update()
+            self.scaler.scale(loss_scaled).backward()
+            if (step_idx + 1) % self.grad_accum_steps == 0:
+                self.scaler.unscale_(self.opt)
+                nn.utils.clip_grad_norm_(_params, self.grad_clip_norm)
+                self.scaler.step(self.opt)
+                self.scaler.update()
         else:
-            loss.backward()
-            nn.utils.clip_grad_norm_(_params, self.grad_clip_norm)
-            self.opt.step()
-        # Normalize prototypes
+            loss_scaled.backward()
+            if (step_idx + 1) % self.grad_accum_steps == 0:
+                nn.utils.clip_grad_norm_(_params, self.grad_clip_norm)
+                self.opt.step()
         with torch.no_grad():
             w = self.prototypes.prototypes.weight.data
             self.prototypes.prototypes.weight.copy_(F.normalize(w, dim=1))
         return loss.item()
+
+    @torch.no_grad()
+    def compute_collapse_metrics(self):
+        if self._last_z is None:
+            return {'embed_std': float('nan'), 'avg_cosine_sim': float('nan')}
+        z = self._last_z.float()
+        embed_std = z.std(dim=0).mean().item()
+        zn = F.normalize(z, dim=1)
+        sim = zn @ zn.t()
+        n = z.shape[0]
+        mask = ~torch.eye(n, device=z.device).bool()
+        return {'embed_std': embed_std, 'avg_cosine_sim': sim[mask].mean().item()}

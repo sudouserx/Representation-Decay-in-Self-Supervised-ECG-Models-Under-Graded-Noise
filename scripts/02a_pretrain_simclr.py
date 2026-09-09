@@ -8,21 +8,22 @@ Kaggle Inputs:  ptbxl-clean-processed, ecg-ssl-utils
 Kaggle Output:  /kaggle/working/ssl-simclr-vit-small/ → publish as 'ssl-simclr-vit-small'
 Est. Runtime:   ~8-10 h (GPU T4)
 """
-import os, sys, json, time, csv
+import os, sys, json, time
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import TensorDataset
 
 CLEAN_DIR = os.environ.get('CLEAN_DIR', '/kaggle/input/ptbxl-clean-processed')
 UTILS_DIR = os.environ.get('UTILS_DIR', '/kaggle/input/ecg-ssl-utils')
-OUTPUT_DIR = '/kaggle/working/ssl-simclr-vit-small'
 
 if UTILS_DIR not in sys.path:
     sys.path.insert(0, UTILS_DIR)
 
+from ecg_ssl_utils.artifact import write_artifact_snapshot
 from ecg_ssl_utils.config import get_config
-from ecg_ssl_utils.models.vit_small_1d import ViTSmall1D
 from ecg_ssl_utils.models.projectors import MLPProjector
+from ecg_ssl_utils.models.vit_small_1d import ViTSmall1D
+from ecg_ssl_utils.repro import make_deterministic_loader, parse_pretrain_seed, set_global_seed
 from ecg_ssl_utils.ssl.augmentations import ECGAugmentation
 from ecg_ssl_utils.ssl.simclr import SimCLRTrainer
 
@@ -35,18 +36,23 @@ COLLAPSE_PATIENCE = 5               # consecutive bad checks before halt
 
 def main():
     cfg = get_config()
+    seed = parse_pretrain_seed(cfg.ssl_training.pretrain_seeds[0])
+    set_global_seed(seed)
+    OUTPUT_DIR = f'/kaggle/working/ssl-simclr-vit-small-seed{seed}'
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Device: {device}")
+    print(f"Device: {device} | seed: {seed}")
 
     # Load training data
     signals_train = np.load(os.path.join(CLEAN_DIR, 'signals_train.npy'))
     print(f"Training signals: {signals_train.shape}")
 
     dataset = TensorDataset(torch.tensor(signals_train, dtype=torch.float32))
-    loader = DataLoader(dataset, batch_size=cfg.ssl_training.batch_size,
-                        shuffle=True, num_workers=cfg.ssl_training.num_workers,
-                        pin_memory=cfg.ssl_training.pin_memory, drop_last=True)
+    loader = make_deterministic_loader(
+        dataset, cfg.ssl_training.batch_size, seed,
+        workers=cfg.ssl_training.num_workers,
+        pin_memory=cfg.ssl_training.pin_memory, drop_last=True,
+    )
 
     # Model
     encoder = ViTSmall1D(
@@ -173,6 +179,7 @@ def main():
     # Save final encoder (no projector)
     torch.save(encoder.state_dict(), os.path.join(OUTPUT_DIR, 'encoder.pt'))
     config_snap = {'paradigm': 'simclr', 'backbone': 'vit_small_1d',
+                   'seed': seed, 'sensitivity_arm': False,
                    'epochs': cfg.ssl_training.epochs, 'batch_size': cfg.ssl_training.batch_size,
                    'effective_batch_size': effective_batch,
                    'lr': cfg.ssl_training.lr, 'temperature': cfg.simclr.temperature,
@@ -181,6 +188,7 @@ def main():
                    'grad_clip_norm': cfg.ssl_training.grad_clip_norm}
     with open(os.path.join(OUTPUT_DIR, 'config.json'), 'w') as f:
         json.dump(config_snap, f, indent=2)
+    write_artifact_snapshot(OUTPUT_DIR, cfg, seed=seed, extra=config_snap, filename='run_snapshot.json')
 
     print(f"\n✓ SimCLR pretraining complete! Saved to {OUTPUT_DIR}")
 

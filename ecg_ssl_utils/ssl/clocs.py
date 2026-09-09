@@ -41,6 +41,7 @@ class CLOCSTrainer:
         use_amp: bool = True,
         device: str = 'cuda',
         grad_clip_norm: float = 1.0,
+        grad_accum_steps: int = 1,
     ):
         self.encoder = encoder.to(device)
         self.projector = projector.to(device)
@@ -56,6 +57,7 @@ class CLOCSTrainer:
         self.use_amp = use_amp
         self.device = device
         self.grad_clip_norm = grad_clip_norm
+        self.grad_accum_steps = grad_accum_steps
         self.scaler = torch.amp.GradScaler('cuda') if use_amp else None
 
         # Cache for collapse metrics
@@ -169,6 +171,7 @@ class CLOCSTrainer:
         self,
         batch: torch.Tensor,
         patient_ids: Optional[torch.Tensor] = None,
+        step_idx: int = 0,
     ) -> Dict[str, float]:
         """
         One training step.
@@ -188,7 +191,8 @@ class CLOCSTrainer:
         self.projector.train()
 
         batch = batch.to(self.device)
-        self.optimizer.zero_grad()
+        if step_idx % self.grad_accum_steps == 0:
+            self.optimizer.zero_grad()
 
         with torch.amp.autocast('cuda', enabled=self.use_amp):
             loss_t = self._temporal_loss(batch)
@@ -203,23 +207,27 @@ class CLOCSTrainer:
                 if loss_p is not None:
                     loss_total = loss_total + self.lambda_patient * loss_p
                     loss_p_val = loss_p.item()
+            loss_scaled = loss_total / self.grad_accum_steps
 
+        do_step = (step_idx + 1) % self.grad_accum_steps == 0
         if self.scaler:
-            self.scaler.scale(loss_total).backward()
-            self.scaler.unscale_(self.optimizer)
-            nn.utils.clip_grad_norm_(
-                list(self.encoder.parameters()) + list(self.projector.parameters()),
-                self.grad_clip_norm,
-            )
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+            self.scaler.scale(loss_scaled).backward()
+            if do_step:
+                self.scaler.unscale_(self.optimizer)
+                nn.utils.clip_grad_norm_(
+                    list(self.encoder.parameters()) + list(self.projector.parameters()),
+                    self.grad_clip_norm,
+                )
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
         else:
-            loss_total.backward()
-            nn.utils.clip_grad_norm_(
-                list(self.encoder.parameters()) + list(self.projector.parameters()),
-                self.grad_clip_norm,
-            )
-            self.optimizer.step()
+            loss_scaled.backward()
+            if do_step:
+                nn.utils.clip_grad_norm_(
+                    list(self.encoder.parameters()) + list(self.projector.parameters()),
+                    self.grad_clip_norm,
+                )
+                self.optimizer.step()
 
         return {
             'total': loss_total.item(),

@@ -4,7 +4,6 @@ Loss: MSE on masked patches. Reference: He et al., CVPR 2022.
 """
 import torch
 import torch.nn as nn
-from typing import Optional, Tuple
 
 
 class MAEDecoder(nn.Module):
@@ -93,29 +92,35 @@ class MAEModel(nn.Module):
 
 class MAETrainer:
     def __init__(self, model, optimizer, scheduler=None, use_amp=True, device='cuda',
-                 grad_clip_norm=1.0):
+                 grad_clip_norm=1.0, grad_accum_steps=1):
         self.model = model.to(device)
         self.opt = optimizer
         self.sched = scheduler
         self.amp = use_amp
         self.dev = device
         self.grad_clip_norm = grad_clip_norm
+        self.grad_accum_steps = grad_accum_steps
         self.scaler = torch.amp.GradScaler('cuda') if use_amp else None
 
-    def train_step(self, batch):
+    def train_step(self, batch, step_idx=0):
         self.model.train()
         batch = batch.to(self.dev)
-        self.opt.zero_grad()
+        if step_idx % self.grad_accum_steps == 0:
+            self.opt.zero_grad()
         with torch.amp.autocast('cuda', enabled=self.amp):
             loss, _, _ = self.model(batch)
+            loss_scaled = loss / self.grad_accum_steps
+        do_step = (step_idx + 1) % self.grad_accum_steps == 0
         if self.scaler:
-            self.scaler.scale(loss).backward()
-            self.scaler.unscale_(self.opt)
-            nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm)
-            self.scaler.step(self.opt)
-            self.scaler.update()
+            self.scaler.scale(loss_scaled).backward()
+            if do_step:
+                self.scaler.unscale_(self.opt)
+                nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm)
+                self.scaler.step(self.opt)
+                self.scaler.update()
         else:
-            loss.backward()
-            nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm)
-            self.opt.step()
+            loss_scaled.backward()
+            if do_step:
+                nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm)
+                self.opt.step()
         return loss.item()
