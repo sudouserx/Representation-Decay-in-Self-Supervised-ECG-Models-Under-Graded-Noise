@@ -29,13 +29,16 @@ class MAEDecoder(nn.Module):
     def forward(self, enc_vis, vis_ids, mask_ids, n_patches):
         B = enc_vis.shape[0]
         x = self.embed(enc_vis)
-        mt = self.mask_token.expand(B, mask_ids.shape[1], -1)
-        full = torch.zeros(B, n_patches, self.dec_dim, device=x.device, dtype=x.dtype)
+        # AMP: Linear outputs fp16/bf16 while nn.Parameters stay fp32;
+        # scatter_ is not autocast-aware and requires matching dtypes.
+        dtype = x.dtype
+        mt = self.mask_token.to(dtype=dtype).expand(B, mask_ids.shape[1], -1)
+        full = torch.zeros(B, n_patches, self.dec_dim, device=x.device, dtype=dtype)
         vi = vis_ids.unsqueeze(-1).expand(-1,-1,self.dec_dim)
         mi = mask_ids.unsqueeze(-1).expand(-1,-1,self.dec_dim)
         full.scatter_(1, vi, x)
         full.scatter_(1, mi, mt)
-        full = full + self.pos
+        full = full + self.pos.to(dtype=dtype)
         for blk in self.blocks:
             full = blk(full)
         full = self.norm(full)
