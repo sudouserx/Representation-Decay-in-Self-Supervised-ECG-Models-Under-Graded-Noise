@@ -67,7 +67,7 @@ ECG_SSL_Haqila_Lab/
 - **Labels**: canonical PTB-XL superclasses with likelihood **threshold 50**; records with an all-zero superclass vector are **excluded**. Threshold-0 variants are also saved (`superclass_labels_raw_*`) for the dataset table.
 - **Split**: folds 1–8 / 9 / 10, patient-disjointness asserted. `--strict-dataset` asserts 21,799 records and 18,869 patients **before** exclusion.
 - **00 also writes** unfiltered `signals_{split}_raw.npy`.
-- **Noise types**: NSTDB BW/MA/EM (`resample_poly` 360→500; **hard-fail** if files missing; 2-channel → 12-lead replication is a documented approximation) plus physically motivated **synthetic** powerline (50 Hz + harmonics, \(A_h=1/h\)), electrode pop, inverter. Not “clinical realism.”
+- **Noise types**: NSTDB BW/MA/EM (`resample_poly` 360→500; **hard-fail** if files missing; 2-channel → 12-lead replication is a documented approximation) plus physically motivated **synthetic** powerline (50 Hz + harmonics, $A_{h}=1/h$), electrode pop, inverter. Not “clinical realism.”
 - **Injection (Option A)**: script 04 injects on raw mV, then applies the **same** band-pass + saved train stats. SNR is therefore physiological. A 45 Hz front-end will attenuate 50 Hz mains — that is a finding.
 - **Grid**: 6 types × 6 SNR (−6…24 dB) × 3 noise seeds + 3 mixtures × 6 × 3 = **162** conditions. Deterministic given `(record_id, type, SNR, seed)`.
 
@@ -117,13 +117,21 @@ Metrics: macro/per-class AUROC, PR-AUC, F1 (tuned thresholds), OvR ECE (15 equal
 
 ### V. Robustness index (secondary)
 
-\[
-R = 0.30(1-\Delta\mathrm{AUROC}_n) + 0.30(1-\Delta\mathrm{ECE}_n) + 0.20(1-\Delta\mathrm{CKA}_n) + 0.20(1-\Delta\mathrm{ER}_n)
-\]
+$$
+R = 0.30(1-\Delta\mathrm{AUROC}_{n}) + 0.30(1-\Delta\mathrm{ECE}_{n}) + 0.20(1-\Delta\mathrm{CKA}_{n}) + 0.20(1-\Delta\mathrm{ER}_{n})
+$$
 
-- \(\Delta\mathrm{CKA}=1-\mathrm{CKA}\); \(\Delta\mathrm{ER}=|1-\mathrm{ER}_n/\mathrm{ER}_c|\) (two-sided); \(\Delta\mathrm{AUROC}=\max(0,\mathrm{AUC}_c-\mathrm{AUC}_n)\); \(\Delta\mathrm{ECE}=\max(0,\mathrm{ECE}_n-\mathrm{ECE}_c)\).
-- Deltas min-max normalized **within the current run**; anchors printed to `normalization_anchors.json`. Do not compare \(R\) across papers.
-- **Gates are filters only** (AUROC &lt; 0.70 or ECE &gt; 0.15 → REJECT in decision support). They do **not** zero \(R\).
+$$
+\begin{aligned}
+\Delta\mathrm{CKA} &= 1 - \mathrm{CKA} \\
+\Delta\mathrm{ER} &= \bigl|1 - \mathrm{ER}_{n}/\mathrm{ER}_{c}\bigr| \quad \text{(two-sided)} \\
+\Delta\mathrm{AUROC} &= \max(0,\ \mathrm{AUC}_{c} - \mathrm{AUC}_{n}) \\
+\Delta\mathrm{ECE} &= \max(0,\ \mathrm{ECE}_{n} - \mathrm{ECE}_{c})
+\end{aligned}
+$$
+
+- Deltas min-max normalized **within the current run**; anchors printed to `normalization_anchors.json`. Do not compare $R$ across papers.
+- **Gates are filters only** (AUROC &lt; 0.70 or ECE &gt; 0.15 → REJECT in decision support). They do **not** zero $R$.
 - Weight stability: Kendall τ vs the pre-registered ranking over 1024 Dirichlet draws (`weight_stability.json`).
 - Primary evidence is the raw 4-dimension table (`raw_dimensions.parquet`).
 
