@@ -50,9 +50,10 @@ def train_probe(representations, labels, val_repr, val_labels,
             logits = probe.fc(val_r)
             probs = torch.sigmoid(logits).cpu().numpy()
         try:
-            auroc = roc_auc_score(val_labels, probs, average='macro', multi_class='ovr')
-        except ValueError:
-            auroc = 0.5
+            auroc = roc_auc_score(val_labels, probs, average='macro')
+        except ValueError as e:
+            print(f"WARNING: roc_auc_score failed ({e}); re-raising.")
+            raise
         if auroc > best_auroc:
             best_auroc = auroc; wait = 0
             best_state = {k: v.clone() for k, v in probe.state_dict().items()}
