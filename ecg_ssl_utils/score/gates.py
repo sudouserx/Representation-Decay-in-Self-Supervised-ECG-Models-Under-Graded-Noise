@@ -15,7 +15,8 @@ def check_robustness_gates(
     ece_gate: float = 0.15
 ) -> GateResult:
     """
-    Check non-compensatory robustness gates.
+    Check AUROC/ECE gates used as decision-support filters only.
+    They do not zero the robustness index.
     
     Parameters
     ----------

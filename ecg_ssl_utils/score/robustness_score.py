@@ -1,30 +1,15 @@
 """
-Robustness Score (formerly Deployment Safety Score / DSS).
+Robustness index (secondary, within-run ranking convenience).
 
-Robustness Score = weighted fusion of:
-  - Performance decay (1 - ΔAUROC_norm)
-  - Calibration degradation (1 - ΔECE_norm)
-  - Representation decay: CKA (1 - ΔCKA_norm) + EffectiveRank (1 - ΔER_norm)
+R = Σ w_k (1 − Δ_k) with pre-registered weights
+(default: AUROC 0.30, ECE 0.30, CKA 0.20, ER 0.20).
 
-Non-compensatory gates on ECE and AUROC reject unsafe models.
-Deployment cost (latency/memory) is a constraint filter in the decision
-artifact, not a component of the robustness score itself.
+ΔER is two-sided at the call site: |1 − ER_noisy/ER_clean|.
+Gates are decision-support filters only — they do not zero this index.
+Deployment cost is a constraint filter, not a score component.
 """
 import numpy as np
-from dataclasses import dataclass, field
 from typing import Dict, Tuple, Optional
-
-
-@dataclass
-class RobustnessResult:
-    model_id: str
-    noise_type: str
-    snr_db: float
-    score: float
-    component_scores: Dict[str, float]
-    weighting: Dict[str, float]
-    uncertainty: Tuple[float, float]
-    gate_passed: bool
 
 
 def compute_robustness_score(
@@ -61,7 +46,7 @@ def compute_robustness_score(
         components: dict of per-axis scores (higher = better).
     """
     if weights is None:
-        weights = {'cka': 0.25, 'erank': 0.25, 'ece': 0.25, 'auroc_decay': 0.25}
+        weights = {'cka': 0.20, 'erank': 0.20, 'ece': 0.30, 'auroc_decay': 0.30}
 
     # Components: higher = better (1 - decay)
     comps = {

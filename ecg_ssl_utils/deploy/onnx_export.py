@@ -1,17 +1,38 @@
-"""ONNX export for ViT-Small 1D encoder."""
-import torch, os
+"""ONNX export for encoder + linear probe.
+
+Band-pass filtering and per-lead z-score normalization stay outside the
+graph (they are applied in scripts 00/04 before inference).
+"""
+import os
+
+import torch
+import torch.nn as nn
 
 
-def export_to_onnx(encoder, output_path, signal_length=5000, n_leads=12, opset=17):
-    """Export PyTorch encoder to ONNX format."""
-    encoder.eval()
+class ClassifierWrapper(nn.Module):
+    """Frozen encoder CLS embedding → linear probe logits/probabilities."""
+
+    def __init__(self, encoder, probe):
+        super().__init__()
+        self.encoder = encoder
+        self.probe = probe
+
+    def forward(self, x):
+        h = self.encoder(x)
+        return self.probe.predict_proba(h)
+
+
+def export_to_onnx(module, output_path, signal_length=5000, n_leads=12, opset=17,
+                   output_name="probabilities"):
+    """Export a torch module (encoder or ClassifierWrapper) to ONNX."""
+    module.eval()
     dummy = torch.randn(1, n_leads, signal_length)
-    if next(encoder.parameters()).is_cuda:
+    if next(module.parameters()).is_cuda:
         dummy = dummy.cuda()
     torch.onnx.export(
-        encoder, dummy, output_path,
-        input_names=['ecg'], output_names=['embedding'],
-        dynamic_axes={'ecg': {0: 'batch'}, 'embedding': {0: 'batch'}},
+        module, dummy, output_path,
+        input_names=["ecg"], output_names=[output_name],
+        dynamic_axes={"ecg": {0: "batch"}, output_name: {0: "batch"}},
         opset_version=opset, do_constant_folding=True,
     )
     size_mb = os.path.getsize(output_path) / 1e6

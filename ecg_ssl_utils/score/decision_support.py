@@ -11,10 +11,13 @@ class ConfigurationResult:
     robustness_score: float
     robustness_gate: GateResult
     deployment_feasible: bool
-    sobol_stability: float
+    weight_stability: float
     status: str  # 'REJECT' | 'RECOMMEND' | 'RECOMMEND_QUALIFIED'
     rejection_reasons: List[str]
     rank: Optional[int] = None
+    latency_p95_ms: float = 0.0
+    memory_mb: float = 0.0
+    parity_cosine: Optional[float] = None
 
 class DecisionSupportEngine:
     """
@@ -26,17 +29,19 @@ class DecisionSupportEngine:
                  max_latency_ms: float = 100.0, 
                  max_memory_mb: float = 512.0,
                  auroc_gate: float = 0.70,
-                 ece_gate: float = 0.15):
+                 ece_gate: float = 0.15,
+                 parity_min_cosine: float = 0.999):
         self.min_robustness = min_robustness
         self.max_latency_s = max_latency_ms / 1000.0
         self.max_memory_mb = max_memory_mb
         self.auroc_gate = auroc_gate
         self.ece_gate = ece_gate
+        self.parity_min_cosine = parity_min_cosine
 
     def evaluate(self, 
                  robustness_df: pd.DataFrame, 
                  deployment_df: pd.DataFrame, 
-                 sobol_results: dict) -> List[ConfigurationResult]:
+                 stability_map: dict) -> List[ConfigurationResult]:
         """
         Evaluate all configurations across all noise conditions.
         Since deployment profiles are independent of noise, we rank models
@@ -60,9 +65,7 @@ class DecisionSupportEngine:
             # Check gates
             gate_res = check_robustness_gates(auroc, ece, self.auroc_gate, self.ece_gate)
             
-            # Get Sobol stability for this model if available (mocked as 1.0 if missing)
-            # Sobol results might provide a confidence score per model
-            stability = sobol_results.get(model_id, 1.0)
+            stability = float(stability_map.get(model_id, 0.0))
             
             d_profiles = deployment_df[deployment_df['model_id'] == model_id]
             for _, d_row in d_profiles.iterrows():
@@ -70,6 +73,9 @@ class DecisionSupportEngine:
                 hw = d_row['provider']
                 lat = d_row['latency_p95']
                 mem = d_row['memory_mb']
+                parity = d_row.get('parity_cosine', None)
+                if hasattr(parity, 'item'):
+                    parity = None if pd.isna(parity) else float(parity)
                 
                 reasons = list(gate_res.rejection_reasons)
                 
@@ -84,6 +90,11 @@ class DecisionSupportEngine:
                 if mem > self.max_memory_mb:
                     deployment_feasible = False
                     reasons.append(f"Memory {mem:.1f}MB > {self.max_memory_mb}MB")
+                if parity is not None and not pd.isna(parity) and float(parity) < self.parity_min_cosine:
+                    deployment_feasible = False
+                    reasons.append(
+                        f"Quantization parity cosine {float(parity):.6f} < {self.parity_min_cosine}"
+                    )
                     
                 status = 'REJECT'
                 if gate_res.passed and deployment_feasible:
@@ -99,9 +110,12 @@ class DecisionSupportEngine:
                     robustness_score=rob_score,
                     robustness_gate=gate_res,
                     deployment_feasible=deployment_feasible,
-                    sobol_stability=stability,
+                    weight_stability=stability,
                     status=status,
-                    rejection_reasons=reasons
+                    rejection_reasons=reasons,
+                    latency_p95_ms=float(lat) * 1000.0 if lat < 10 else float(lat),
+                    memory_mb=float(mem),
+                    parity_cosine=None if parity is None or (isinstance(parity, float) and pd.isna(parity)) else float(parity),
                 ))
                 
         # Rank the recommendations

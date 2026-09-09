@@ -1,12 +1,11 @@
 """HTML leaderboard generator with hardware-ceiling filtering."""
 import pandas as pd
-from typing import Optional
 
 
-def generate_leaderboard(dss_df, deploy_df, save_path='leaderboard.html',
+def generate_leaderboard(dss_df, save_path='leaderboard.html',
                          max_latency=None, max_memory=None,
                          min_auroc=None, max_ece=None):
-    """Generate filterable HTML leaderboard from DSS and deployment data."""
+    """Generate HTML leaderboard from min-SNR robustness rows (latency already merged)."""
     merged = dss_df.copy()
     if max_latency:
         merged = merged[merged['latency_p50'] <= max_latency]
