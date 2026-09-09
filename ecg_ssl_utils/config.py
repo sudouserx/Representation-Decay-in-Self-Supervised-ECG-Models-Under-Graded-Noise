@@ -28,9 +28,15 @@ class DataConfig:
     train_folds: List[int] = field(default_factory=lambda: [1, 2, 3, 4, 5, 6, 7, 8])
     val_folds: List[int] = field(default_factory=lambda: [9])
     test_folds: List[int] = field(default_factory=lambda: [10])
-    bandpass_low: float = 0.5           # Hz
+    bandpass_low: float = 0.05          # Hz (diagnostic-mode; preserves ST segments)
     bandpass_high: float = 45.0         # Hz
     filter_order: int = 4
+    label_threshold: float = 50.0       # PTB-XL likelihood threshold for canonical labels
+    exclude_no_superclass: bool = True  # drop records with all-zero superclass vector
+    strict_dataset: bool = True         # assert N==21799 and 18869 unique patients
+    expected_n_records: int = 21799
+    expected_n_patients: int = 18869
+    ptbxl_version: str = "1.0.3"
 
 
 # ──────────────────────────────────────────────────────────────
@@ -42,7 +48,7 @@ class NoiseConfig:
     snr_grid: List[float] = field(default_factory=lambda: [24, 18, 12, 6, 0, -6])
     # Seeds control noise injection determinism ONLY.
     # Each corruption condition is realized 3 times using these seeds.
-    # SSL pretraining runs once per paradigm (not repeated).
+    # Pretraining seeds live on SSLTrainingConfig.pretrain_seeds.
     seeds: List[int] = field(default_factory=lambda: [42, 123, 456])
     noise_types_single: List[str] = field(default_factory=lambda: [
         'bw', 'ma', 'em', 'powerline', 'electrode_pop', 'inverter'
@@ -96,6 +102,7 @@ class SSLTrainingConfig:
     pin_memory: bool = True
     grad_accum_steps: int = 4            # effective batch = 256 × 4 = 1024
     grad_clip_norm: float = 1.0          # max gradient norm for clipping
+    pretrain_seeds: List[int] = field(default_factory=lambda: [42, 123, 456])
 
 
 @dataclass
@@ -191,14 +198,18 @@ class ProbeConfig:
 class EvalConfig:
     """Metric computation settings."""
     ece_bins: int = 15
+    ece_equal_mass: bool = True         # also report equal-mass (quantile) ECE
     bootstrap_n: int = 1000
     bootstrap_seed: int = 42
+    er_bootstrap_n: int = 200           # cheaper ER bootstrap
+    er_bootstrap_subsample: int = 1500  # patients per ER resample
     min_class_positives: int = 5        # skip classes with fewer positives
     age_bins: List[int] = field(default_factory=lambda: [0, 40, 60, 80, 120])
     age_bin_labels: List[str] = field(default_factory=lambda: [
         '0-40', '40-60', '60-80', '80+'
     ])
     delong_alpha: float = 0.05
+    collapse_var_guard: float = 1e-6    # CKA returns nan below this column-std
 
 
 # ──────────────────────────────────────────────────────────────
@@ -208,7 +219,7 @@ class EvalConfig:
 class DeployConfig:
     """ONNX export and profiling settings."""
     quantization_modes: List[str] = field(default_factory=lambda: [
-        'fp32', 'int8_dynamic', 'int8_static', 'selective'
+        'fp32', 'int8_dynamic', 'int8_static'
     ])
     providers: List[str] = field(default_factory=lambda: [
         'CPUExecutionProvider', 'CUDAExecutionProvider'
@@ -216,8 +227,9 @@ class DeployConfig:
     warmup_runs: int = 50
     benchmark_runs: int = 1000
     calibration_samples: int = 200
+    parity_samples: int = 500
+    parity_min_cosine: float = 0.999
     opset_version: int = 17
-    estimated_inference_power_w: float = 30.0   # T4 est. inference power
 
 
 # ──────────────────────────────────────────────────────────────
@@ -225,14 +237,18 @@ class DeployConfig:
 # ──────────────────────────────────────────────────────────────
 @dataclass
 class DSSConfig:
-    """Robustness Score settings (formerly Deployment Safety Score)."""
+    """Robustness index settings (secondary, within-run ranking convenience).
+
+    Gates are decision-support filters only — they do not zero the index.
+    Weights are pre-registered: task + calibration 0.30 each; geometry 0.20 each.
+    """
     weights: Dict[str, float] = field(default_factory=lambda: {
-        'cka': 0.25, 'erank': 0.25, 'ece': 0.25, 'auroc_decay': 0.25
+        'cka': 0.20, 'erank': 0.20, 'ece': 0.30, 'auroc_decay': 0.30
     })
-    ece_gate: float = 0.15              # non-compensatory safety gate
+    ece_gate: float = 0.15              # decision-support filter only
     auroc_gate: float = 0.70
     normalization: str = 'reference_anchored_minmax'
-    sobol_samples: int = 1024
+    stability_samples: int = 1024       # Dirichlet draws for Kendall-τ
     bootstrap_n: int = 1000
     epsilon: float = 1e-8
 

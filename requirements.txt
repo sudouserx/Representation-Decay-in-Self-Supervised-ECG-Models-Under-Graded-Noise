@@ -6,4 +6,8 @@ matplotlib
 tqdm
 wfdb
 torch
+onnx
 onnxruntime-gpu
+statsmodels
+psutil
+pytest
