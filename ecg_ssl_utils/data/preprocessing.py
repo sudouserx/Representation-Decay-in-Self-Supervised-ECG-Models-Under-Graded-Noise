@@ -2,21 +2,26 @@
 ECG signal preprocessing: bandpass filtering and normalization.
 """
 
-import numpy as np
-from scipy.signal import butter, filtfilt
-from typing import Tuple, Optional, Dict
 import json
+from typing import Dict
+
+import numpy as np
+from scipy.signal import butter, sosfiltfilt
 
 
 def bandpass_filter(
     signals: np.ndarray,
-    low: float = 0.5,
+    low: float = 0.05,
     high: float = 45.0,
     fs: int = 500,
     order: int = 4,
 ) -> np.ndarray:
     """
-    Apply zero-phase Butterworth bandpass filter to ECG signals.
+    Apply zero-phase Butterworth bandpass filter via second-order sections.
+
+    Diagnostic-mode default (0.05–45 Hz) preserves ST-segment content needed
+    for the STTC superclass. Uses sosfiltfilt (numerically stable at 0.05 Hz
+    / 500 Hz) rather than transfer-function filtfilt.
 
     Parameters
     ----------
@@ -35,16 +40,14 @@ def bandpass_filter(
         Same shape as input.
     """
     nyq = fs / 2.0
-    b, a = butter(order, [low / nyq, high / nyq], btype='band')
+    sos = butter(order, [low / nyq, high / nyq], btype="band", output="sos")
 
     if signals.ndim == 2:
-        # Single record: (12, L)
-        return filtfilt(b, a, signals, axis=-1).astype(np.float32)
+        return sosfiltfilt(sos, signals, axis=-1).astype(np.float32)
 
-    # Batch: (N, 12, L)
     filtered = np.empty_like(signals)
     for i in range(signals.shape[0]):
-        filtered[i] = filtfilt(b, a, signals[i], axis=-1)
+        filtered[i] = sosfiltfilt(sos, signals[i], axis=-1)
     return filtered.astype(np.float32)
 
 
@@ -63,12 +66,10 @@ def compute_norm_stats(
     -------
     dict with 'mean' (12,) and 'std' (12,).
     """
-    # Mean and std per lead across all samples and time steps
-    mean = signals.mean(axis=(0, 2))   # (12,)
-    std = signals.std(axis=(0, 2))     # (12,)
-    # Avoid division by zero
+    mean = signals.mean(axis=(0, 2))
+    std = signals.std(axis=(0, 2))
     std = np.where(std < 1e-8, 1.0, std)
-    return {'mean': mean.astype(np.float32), 'std': std.astype(np.float32)}
+    return {"mean": mean.astype(np.float32), "std": std.astype(np.float32)}
 
 
 def normalize_signals(
@@ -85,32 +86,27 @@ def normalize_signals(
         Shape (N, 12, L) or (12, L).
     mean, std : np.ndarray
         Shape (12,). Computed from training set.
-
-    Returns
-    -------
-    normalized : np.ndarray
     """
     if signals.ndim == 2:
         return ((signals - mean[:, None]) / std[:, None]).astype(np.float32)
-    # Batch
     return ((signals - mean[None, :, None]) / std[None, :, None]).astype(np.float32)
 
 
 def save_norm_stats(stats: Dict[str, np.ndarray], path: str):
     """Save normalization stats to JSON."""
     data = {
-        'mean': stats['mean'].tolist(),
-        'std': stats['std'].tolist(),
+        "mean": stats["mean"].tolist(),
+        "std": stats["std"].tolist(),
     }
-    with open(path, 'w') as f:
+    with open(path, "w") as f:
         json.dump(data, f, indent=2)
 
 
 def load_norm_stats(path: str) -> Dict[str, np.ndarray]:
     """Load normalization stats from JSON."""
-    with open(path, 'r') as f:
+    with open(path, "r") as f:
         data = json.load(f)
     return {
-        'mean': np.array(data['mean'], dtype=np.float32),
-        'std': np.array(data['std'], dtype=np.float32),
+        "mean": np.array(data["mean"], dtype=np.float32),
+        "std": np.array(data["std"], dtype=np.float32),
     }

@@ -131,10 +131,17 @@ def get_superclass_mapping(scp_statements_path: str) -> Dict[str, str]:
     return mapping
 
 
+def drop_empty_superclass_rows(
+    labels: np.ndarray,
+) -> np.ndarray:
+    """Boolean mask of rows that have at least one superclass label."""
+    return labels.sum(axis=1) > 0
+
+
 def encode_superclass_labels(
     metadata: pd.DataFrame,
     scp_statements_path: str,
-    threshold: float = 0.0,
+    threshold: float = 50.0,
 ) -> np.ndarray:
     """
     Encode SCP codes as 5-class superclass multi-hot vectors.
@@ -151,7 +158,7 @@ def encode_superclass_labels(
         Path to scp_statements.csv from PTB-XL dataset.
     threshold : float
         Minimum likelihood to include a label (PTB-XL uses 0-100 scale).
-        Default 0.0 includes all annotated codes.
+        Default 50.0 matches the canonical PTB-XL benchmark construction.
 
     Returns
     -------
