@@ -19,7 +19,11 @@ def generate_powerline_noise(
     Generate 50 Hz powerline interference with harmonics.
 
     n(t) = Σ_{h=1}^{H} A_h · sin(2π · 50h · t + φ_h)
-    A_1=1.0, A_2=0.5, A_3=0.25; φ_h ~ Uniform(0, 2π)
+    A_h = 1/h  (A_1=1.0, A_2=0.5, A_3=1/3); φ_h ~ Uniform(0, 2π) per lead.
+
+    Physically motivated synthetic corruption — not a field-validated
+    clinical artifact model. Independent per-lead phase is not common-mode
+    realistic.
 
     Parameters
     ----------

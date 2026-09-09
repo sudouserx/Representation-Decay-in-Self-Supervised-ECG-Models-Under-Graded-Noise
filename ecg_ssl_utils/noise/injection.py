@@ -86,6 +86,9 @@ def inject_noise(
     Inject noise into a clean ECG signal at a specified SNR.
 
     The injection is deterministic given (record_id, noise_type, snr_db, seed).
+    SNR is defined on the signal as passed in: when callers inject on raw mV
+    recordings (script 04 Option A), the dB grid is physiological. When
+    callers inject on z-scored signals, document that convention.
 
     Parameters
     ----------
