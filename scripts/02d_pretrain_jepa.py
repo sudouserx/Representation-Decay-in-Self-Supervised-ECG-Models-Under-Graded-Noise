@@ -16,7 +16,10 @@ if UTILS_DIR not in sys.path: sys.path.insert(0, UTILS_DIR)
 from ecg_ssl_utils.artifact import write_artifact_snapshot
 from ecg_ssl_utils.config import get_config
 from ecg_ssl_utils.models.vit_small_1d import ViTSmall1D
-from ecg_ssl_utils.repro import make_deterministic_loader, parse_pretrain_seed, set_global_seed
+from ecg_ssl_utils.repro import (
+    checkpoint_runtime_state, make_deterministic_loader, parse_pretrain_seed,
+    restore_runtime_state, set_global_seed,
+)
 from ecg_ssl_utils.ssl.jepa import JEPAPredictor, JEPAModel, JEPATrainer
 
 
@@ -71,7 +74,7 @@ def main():
     start_epoch = 0
     ckpt_path = os.path.join(OUTPUT_DIR, 'checkpoint.pt')
     if os.path.exists(ckpt_path):
-        ckpt = torch.load(ckpt_path, map_location=device)
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         jepa.context_encoder.load_state_dict(ckpt['encoder'])
         if 'predictor' in ckpt:
             jepa.predictor.load_state_dict(ckpt['predictor'])
@@ -80,8 +83,9 @@ def main():
         if 'optimizer' in ckpt:
             optimizer.load_state_dict(ckpt['optimizer'])
         start_epoch = ckpt['epoch'] + 1
-        for _ in range(start_epoch):
-            scheduler.step()
+        if "rng_state" not in ckpt:
+            for _ in range(start_epoch):
+                scheduler.step()
         print(f"Resuming from epoch {start_epoch}")
 
     trainer = JEPATrainer(jepa, optimizer, scheduler,
@@ -91,6 +95,8 @@ def main():
                           use_amp=cfg.ssl_training.use_amp, device=device,
                           grad_clip_norm=cfg.ssl_training.grad_clip_norm,
                           grad_accum_steps=cfg.ssl_training.grad_accum_steps)
+    if start_epoch:
+        restore_runtime_state(ckpt, scheduler, trainer.scaler, loader)
 
     log = open(os.path.join(OUTPUT_DIR, 'train_log.csv'),
                'a' if start_epoch > 0 else 'w')
@@ -104,7 +110,10 @@ def main():
 
     for epoch in range(start_epoch, total_epochs):
         t0 = time.time()
-        losses = [trainer.train_step(b[0], epoch, step_idx=i) for i, b in enumerate(loader)]
+        losses = [
+            trainer.train_step(b[0], epoch, step_idx=i, total_steps=len(loader))
+            for i, b in enumerate(loader)
+        ]
         scheduler.step()
         avg = np.mean(losses)
         lr = optimizer.param_groups[0]['lr']
@@ -125,7 +134,8 @@ def main():
                         'encoder': jepa.context_encoder.state_dict(),
                         'predictor': jepa.predictor.state_dict(),
                         'target_encoder': jepa.target_encoder.state_dict(),
-                        'optimizer': optimizer.state_dict()},
+                        'optimizer': optimizer.state_dict(),
+                        **checkpoint_runtime_state(scheduler, trainer.scaler, loader)},
                        os.path.join(OUTPUT_DIR, 'checkpoint.pt'))
 
     log.close()

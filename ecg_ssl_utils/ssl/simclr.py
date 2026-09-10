@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Dict
+from ecg_ssl_utils.repro import accumulation_state
 
 
 def nt_xent_loss(
@@ -107,10 +108,12 @@ class SimCLRTrainer:
         self.scaler = torch.amp.GradScaler('cuda') if use_amp else None
 
         # Running buffer of recent projections (not only the last batch)
-        self._z_buffer = []
-        self._z_buffer_max = 8
+        self._repr_buffer = []
+        self._repr_buffer_max = 8
 
-    def train_step(self, batch: torch.Tensor, step_idx: int = 0) -> float:
+    def train_step(
+        self, batch: torch.Tensor, step_idx: int = 0, total_steps: int = 1,
+    ) -> float:
         """
         One training step with gradient accumulation and clipping.
 
@@ -138,6 +141,9 @@ class SimCLRTrainer:
         if step_idx % self.grad_accum_steps == 0:
             self.optimizer.zero_grad()
 
+        window_size, do_step = accumulation_state(
+            step_idx, total_steps, self.grad_accum_steps,
+        )
         with torch.amp.autocast('cuda', enabled=self.use_amp):
             # Encode
             h1 = self.encoder(view1)  # (B, 384)
@@ -149,16 +155,16 @@ class SimCLRTrainer:
 
             # Loss (scaled for accumulation)
             loss = nt_xent_loss(z1, z2, self.temperature)
-            loss_scaled = loss / self.grad_accum_steps
+            loss_scaled = loss / window_size
 
-        self._z_buffer.append(torch.cat([z1.detach(), z2.detach()], dim=0).cpu())
-        if len(self._z_buffer) > self._z_buffer_max:
-            self._z_buffer.pop(0)
+        self._repr_buffer.append(torch.cat([h1.detach(), h2.detach()], dim=0).cpu())
+        if len(self._repr_buffer) > self._repr_buffer_max:
+            self._repr_buffer.pop(0)
 
         if self.scaler:
             self.scaler.scale(loss_scaled).backward()
             # Step only at accumulation boundaries
-            if (step_idx + 1) % self.grad_accum_steps == 0:
+            if do_step:
                 self.scaler.unscale_(self.optimizer)
                 nn.utils.clip_grad_norm_(
                     list(self.encoder.parameters()) + list(self.projector.parameters()),
@@ -168,7 +174,7 @@ class SimCLRTrainer:
                 self.scaler.update()
         else:
             loss_scaled.backward()
-            if (step_idx + 1) % self.grad_accum_steps == 0:
+            if do_step:
                 nn.utils.clip_grad_norm_(
                     list(self.encoder.parameters()) + list(self.projector.parameters()),
                     self.grad_clip_norm,
@@ -188,10 +194,10 @@ class SimCLRTrainer:
             - embed_std: mean std-dev across embedding dimensions (collapse → 0)
             - avg_cosine_sim: mean pairwise cosine similarity of negatives (collapse → 1.0)
         """
-        if not self._z_buffer:
+        if not self._repr_buffer:
             return {'embed_std': float('nan'), 'avg_cosine_sim': float('nan')}
 
-        z = torch.cat(self._z_buffer, dim=0).float()
+        z = torch.cat(self._repr_buffer, dim=0).float()
 
         # 1. Embedding std: mean of per-dimension std across the batch
         embed_std = z.std(dim=0).mean().item()

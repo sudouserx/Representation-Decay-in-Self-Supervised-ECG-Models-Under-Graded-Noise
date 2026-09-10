@@ -6,6 +6,7 @@ Reference: Grill et al., NeurIPS 2020.
 """
 import torch, torch.nn as nn, torch.nn.functional as F, copy, math
 from typing import Optional
+from ecg_ssl_utils.repro import accumulation_state
 
 
 class BYOLTrainer:
@@ -44,25 +45,29 @@ class BYOLTrainer:
         z = F.normalize(z, dim=-1)
         return 2 - 2 * (q * z).sum(dim=-1).mean()
 
-    def train_step(self, batch, epoch=0, step_idx=0):
+    def train_step(self, batch, epoch=0, step_idx=0, total_steps=1):
         self.online_encoder.train(); self.online_projector.train(); self.predictor.train()
         batch = batch.to(self.dev)
         v1, v2 = self.augmentation(batch), self.augmentation(batch)
         if step_idx % self.grad_accum_steps == 0:
             self.opt.zero_grad()
+        window_size, do_step = accumulation_state(
+            step_idx, total_steps, self.grad_accum_steps,
+        )
         with torch.amp.autocast('cuda', enabled=self.amp):
-            o1 = self.predictor(self.online_projector(self.online_encoder(v1)))
-            o2 = self.predictor(self.online_projector(self.online_encoder(v2)))
+            h1 = self.online_encoder(v1)
+            h2 = self.online_encoder(v2)
+            o1 = self.predictor(self.online_projector(h1))
+            o2 = self.predictor(self.online_projector(h2))
             with torch.no_grad():
                 t1 = self.target_projector(self.target_encoder(v1))
                 t2 = self.target_projector(self.target_encoder(v2))
             loss = self._loss(o1, t2.detach()) + self._loss(o2, t1.detach())
-            loss_scaled = loss / self.grad_accum_steps
-        self._last_z = torch.cat([o1.detach(), o2.detach()], dim=0)
+            loss_scaled = loss / window_size
+        self._last_z = torch.cat([h1.detach(), h2.detach()], dim=0)
         _params = (list(self.online_encoder.parameters()) +
                    list(self.online_projector.parameters()) +
                    list(self.predictor.parameters()))
-        do_step = (step_idx + 1) % self.grad_accum_steps == 0
         if self.scaler:
             self.scaler.scale(loss_scaled).backward()
             if do_step:

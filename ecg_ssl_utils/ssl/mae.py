@@ -4,6 +4,7 @@ Loss: MSE on masked patches. Reference: He et al., CVPR 2022.
 """
 import torch
 import torch.nn as nn
+from ecg_ssl_utils.repro import accumulation_state
 
 
 class MAEDecoder(nn.Module):
@@ -53,6 +54,7 @@ class MAEModel(nn.Module):
         self.encoder = encoder
         self.decoder = decoder
         self.mask_ratio = mask_ratio
+        self._last_cls = None
 
     def _mask(self, B, N, device):
         nm = int(N * self.mask_ratio)
@@ -83,6 +85,7 @@ class MAEModel(nn.Module):
         for blk in self.encoder.blocks:
             tok = blk(tok)
         tok = self.encoder.norm(tok)
+        self._last_cls = tok[:, 0, :].detach()
         enc_vis = tok[:,1:,:]
         pred = self.decoder(enc_vis, vis_ids, mask_ids, N)
         mi = mask_ids.unsqueeze(-1).expand(-1,-1,target.shape[-1])
@@ -105,15 +108,17 @@ class MAETrainer:
         self.grad_accum_steps = grad_accum_steps
         self.scaler = torch.amp.GradScaler('cuda') if use_amp else None
 
-    def train_step(self, batch, step_idx=0):
+    def train_step(self, batch, step_idx=0, total_steps=1):
         self.model.train()
         batch = batch.to(self.dev)
         if step_idx % self.grad_accum_steps == 0:
             self.opt.zero_grad()
+        window_size, do_step = accumulation_state(
+            step_idx, total_steps, self.grad_accum_steps,
+        )
         with torch.amp.autocast('cuda', enabled=self.amp):
             loss, _, _ = self.model(batch)
-            loss_scaled = loss / self.grad_accum_steps
-        do_step = (step_idx + 1) % self.grad_accum_steps == 0
+            loss_scaled = loss / window_size
         if self.scaler:
             self.scaler.scale(loss_scaled).backward()
             if do_step:
@@ -127,3 +132,25 @@ class MAETrainer:
                 nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm)
                 self.opt.step()
         return loss.item()
+
+    @torch.no_grad()
+    def compute_collapse_metrics(self):
+        z = self.model._last_cls
+        if z is None:
+            return {'embed_std': float('nan'), 'avg_cosine_sim': float('nan')}
+        z = z.float()
+        std = z.std(dim=0).mean().item()
+        zn = torch.nn.functional.normalize(z, dim=1)
+        sim = zn @ zn.T
+        mask = ~torch.eye(len(z), dtype=torch.bool, device=z.device)
+        return {'embed_std': std, 'avg_cosine_sim': sim[mask].mean().item()}
+
+    @torch.no_grad()
+    def validation_loss(self, batch, seed=0):
+        """Deterministic masked-reconstruction loss on a held-out batch."""
+        self.model.eval()
+        devices = [torch.cuda.current_device()] if self.dev.startswith('cuda') else []
+        with torch.random.fork_rng(devices=devices):
+            torch.manual_seed(seed)
+            loss, _, _ = self.model(batch.to(self.dev))
+        return float(loss.item())

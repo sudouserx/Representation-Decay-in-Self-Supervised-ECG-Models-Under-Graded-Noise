@@ -13,6 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, List, Dict
 from .simclr import nt_xent_loss
+from ecg_ssl_utils.repro import accumulation_state
 
 
 class CLOCSTrainer:
@@ -63,6 +64,7 @@ class CLOCSTrainer:
         # Cache for collapse metrics
         self._last_z1 = None
         self._last_z2 = None
+        self._last_patient_pairs = 0
 
     def _temporal_loss(self, batch: torch.Tensor) -> torch.Tensor:
         """
@@ -90,8 +92,8 @@ class CLOCSTrainer:
         z2 = self.projector(h2)
 
         # Cache for collapse metrics
-        self._last_z1 = z1.detach()
-        self._last_z2 = z2.detach()
+        self._last_z1 = h1.detach()
+        self._last_z2 = h2.detach()
 
         return nt_xent_loss(z1, z2, self.temperature)
 
@@ -141,6 +143,7 @@ class CLOCSTrainer:
         # Find patients with multiple recordings in this batch
         unique_patients, counts = torch.unique(patient_ids, return_counts=True)
         multi_patients = unique_patients[counts >= 2]
+        self._last_patient_pairs = int(len(multi_patients))
 
         if len(multi_patients) == 0:
             return None
@@ -172,6 +175,7 @@ class CLOCSTrainer:
         batch: torch.Tensor,
         patient_ids: Optional[torch.Tensor] = None,
         step_idx: int = 0,
+        total_steps: int = 1,
     ) -> Dict[str, float]:
         """
         One training step.
@@ -194,6 +198,9 @@ class CLOCSTrainer:
         if step_idx % self.grad_accum_steps == 0:
             self.optimizer.zero_grad()
 
+        window_size, do_step = accumulation_state(
+            step_idx, total_steps, self.grad_accum_steps,
+        )
         with torch.amp.autocast('cuda', enabled=self.use_amp):
             loss_t = self._temporal_loss(batch)
             loss_s = self._spatial_loss(batch)
@@ -207,9 +214,8 @@ class CLOCSTrainer:
                 if loss_p is not None:
                     loss_total = loss_total + self.lambda_patient * loss_p
                     loss_p_val = loss_p.item()
-            loss_scaled = loss_total / self.grad_accum_steps
+            loss_scaled = loss_total / window_size
 
-        do_step = (step_idx + 1) % self.grad_accum_steps == 0
         if self.scaler:
             self.scaler.scale(loss_scaled).backward()
             if do_step:
@@ -234,6 +240,8 @@ class CLOCSTrainer:
             'temporal': loss_t.item(),
             'spatial': loss_s.item(),
             'patient': loss_p_val,
+            'patient_pairs': self._last_patient_pairs,
+            'patient_active': int(self._last_patient_pairs >= 2),
         }
 
     @torch.no_grad()

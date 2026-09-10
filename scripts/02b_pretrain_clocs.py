@@ -11,7 +11,7 @@ Kaggle Output:  /kaggle/working/ssl-clocs-vit-small-seed<seed>/
 import os, sys, json, time
 import numpy as np
 import torch
-from torch.utils.data import TensorDataset
+from torch.utils.data import DataLoader, TensorDataset
 
 CLEAN_DIR = os.environ.get('CLEAN_DIR', '/kaggle/input/ptbxl-clean-processed')
 UTILS_DIR = os.environ.get('UTILS_DIR', '/kaggle/input/ecg-ssl-utils')
@@ -22,7 +22,10 @@ from ecg_ssl_utils.artifact import write_artifact_snapshot
 from ecg_ssl_utils.config import get_config
 from ecg_ssl_utils.models.projectors import MLPProjector
 from ecg_ssl_utils.models.vit_small_1d import ViTSmall1D
-from ecg_ssl_utils.repro import make_deterministic_loader, parse_pretrain_seed, set_global_seed
+from ecg_ssl_utils.repro import (
+    PatientPairBatchSampler, checkpoint_runtime_state, parse_pretrain_seed,
+    restore_runtime_state, set_global_seed,
+)
 from ecg_ssl_utils.ssl.clocs import CLOCSTrainer
 import pandas as pd
 
@@ -51,13 +54,18 @@ def main():
     # CLOCS runs the encoder 6× per batch (2× temporal + 2× spatial + 2× patient),
     # requiring ~3× SimCLR's GPU memory. Override batch_size to avoid T4 OOM.
     clocs_batch_size = min(cfg.ssl_training.batch_size, 128)
-    # 128 × 8 = 1024 effective batch to approach SimCLR epoch-budget honesty
+    # Match samples per optimizer update; NT-Xent negatives still come only
+    # from the physical microbatch.
     grad_accum_steps = max(1, (cfg.ssl_training.batch_size * cfg.ssl_training.grad_accum_steps) // clocs_batch_size)
 
     dataset = TensorDataset(torch.tensor(signals, dtype=torch.float32), patient_ids)
-    loader = make_deterministic_loader(
-        dataset, clocs_batch_size, seed,
-        workers=cfg.ssl_training.num_workers, pin_memory=True, drop_last=True,
+    batch_sampler = PatientPairBatchSampler(
+        train_meta['patient_id'].values, clocs_batch_size, seed,
+        pairs_per_batch=2, drop_last=True,
+    )
+    loader = DataLoader(
+        dataset, batch_sampler=batch_sampler,
+        num_workers=cfg.ssl_training.num_workers, pin_memory=True,
     )
 
     encoder = ViTSmall1D(patch_size=cfg.backbone.patch_size, embed_dim=cfg.backbone.embed_dim,
@@ -88,13 +96,14 @@ def main():
     start_epoch = 0
     ckpt_path = os.path.join(OUTPUT_DIR, 'checkpoint.pt')
     if os.path.exists(ckpt_path):
-        ckpt = torch.load(ckpt_path, map_location=device)
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         encoder.load_state_dict(ckpt['encoder'])
         projector.load_state_dict(ckpt['projector'])
         optimizer.load_state_dict(ckpt['optimizer'])
         start_epoch = ckpt['epoch'] + 1
-        for _ in range(start_epoch):
-            scheduler.step()
+        if "rng_state" not in ckpt:
+            for _ in range(start_epoch):
+                scheduler.step()
         print(f"Resuming from epoch {start_epoch}")
 
     trainer = CLOCSTrainer(encoder, projector, optimizer, scheduler,
@@ -105,16 +114,21 @@ def main():
                            use_amp=cfg.ssl_training.use_amp, device=device,
                            grad_clip_norm=cfg.ssl_training.grad_clip_norm,
                            grad_accum_steps=grad_accum_steps)
+    if start_epoch:
+        restore_runtime_state(ckpt, scheduler, trainer.scaler, loader)
 
     log = open(os.path.join(OUTPUT_DIR, 'train_log.csv'),
                'a' if start_epoch > 0 else 'w')
     if start_epoch == 0:
         log.write('epoch,loss_total,loss_temporal,loss_spatial,loss_patient,'
+                  'patient_pairs_per_batch,patient_active_fraction,'
                   'lr,time_s,embed_std,avg_cosine_sim\n')
 
     print(f"\nTraining CLOCS for {total_epochs} epochs")
-    print(f"  Batch size: {clocs_batch_size} × {grad_accum_steps} accum "
-          f"(CLOCS-adapted; 6 encoder fwd passes/step)")
+    print(f"  Physical contrastive batch: {clocs_batch_size} "
+          f"({2 * clocs_batch_size - 2} negatives/anchor)")
+    print(f"  Optimizer accumulation: ×{grad_accum_steps}; "
+          "6 encoder forward passes/microbatch")
     print(f"  Temperature: {cfg.clocs.temperature}")
     print(f"  Warmup: {warmup_epochs} epochs")
     print(f"  Grad clip norm: {cfg.ssl_training.grad_clip_norm}")
@@ -125,7 +139,9 @@ def main():
         t0 = time.time()
         ep_losses = []
         for step_idx, (batch_sig, batch_pid) in enumerate(loader):
-            losses = trainer.train_step(batch_sig, batch_pid, step_idx=step_idx)
+            losses = trainer.train_step(
+                batch_sig, batch_pid, step_idx=step_idx, total_steps=len(loader),
+            )
             ep_losses.append(losses)
         scheduler.step()
 
@@ -141,7 +157,8 @@ def main():
 
             print(f"  Epoch {epoch:3d} | Total: {avg['total']:.4f} | "
                   f"T: {avg['temporal']:.4f} | S: {avg['spatial']:.4f} | "
-                  f"P: {avg['patient']:.4f} | LR: {lr:.6f} | {elapsed:.0f}s | "
+                  f"P: {avg['patient']:.4f} | active: {avg['patient_active']:.2f} | "
+                  f"LR: {lr:.6f} | {elapsed:.0f}s | "
                   f"std: {embed_std:.4f} | cos_sim: {avg_cosine_sim:.4f}")
 
             # Collapse early-stopping
@@ -160,13 +177,15 @@ def main():
 
         log.write(f"{epoch},{avg['total']:.6f},{avg['temporal']:.6f},"
                   f"{avg['spatial']:.6f},{avg['patient']:.6f},"
+                  f"{avg['patient_pairs']:.3f},{avg['patient_active']:.6f},"
                   f"{lr:.8f},{elapsed:.1f},{embed_std:.6f},{avg_cosine_sim:.6f}\n")
         log.flush()
 
         if (epoch + 1) % cfg.ssl_training.checkpoint_every == 0:
             torch.save({'epoch': epoch, 'encoder': encoder.state_dict(),
                         'projector': projector.state_dict(),
-                        'optimizer': optimizer.state_dict()}, ckpt_path)
+                        'optimizer': optimizer.state_dict(),
+                        **checkpoint_runtime_state(scheduler, trainer.scaler, loader)}, ckpt_path)
 
     log.close()
     torch.save(encoder.state_dict(), os.path.join(OUTPUT_DIR, 'encoder.pt'))

@@ -5,6 +5,7 @@ Reference: Caron et al., NeurIPS 2020.
 """
 import torch, torch.nn as nn, torch.nn.functional as F
 from typing import Optional
+from ecg_ssl_utils.repro import accumulation_state
 
 
 def sinkhorn(Q, niters=3, epsilon=0.05):
@@ -41,6 +42,7 @@ class SwAVTrainer:
         self.grad_accum_steps = grad_accum_steps
         self.scaler = torch.amp.GradScaler('cuda') if use_amp else None
         self._last_z = None
+        self._last_assignments = None
 
     def _swav_loss(self, z1, z2):
         """Swapped prediction loss."""
@@ -53,37 +55,43 @@ class SwAVTrainer:
         # Codes via Sinkhorn
         q1 = sinkhorn(s1.detach(), self.sk_iters, self.sk_eps)
         q2 = sinkhorn(s2.detach(), self.sk_iters, self.sk_eps)
+        self._last_assignments = torch.cat([q1, q2], dim=0)
         # Cross-entropy losses
         p1 = F.log_softmax(s1 / self.tau, dim=1)
         p2 = F.log_softmax(s2 / self.tau, dim=1)
         loss = -0.5 * (q2 * p1 + q1 * p2).sum(dim=1).mean()
         return loss
 
-    def train_step(self, batch, step_idx=0):
+    def train_step(self, batch, step_idx=0, total_steps=1):
         self.encoder.train(); self.projector.train()
         batch = batch.to(self.dev)
         v1, v2 = self.augmentation(batch), self.augmentation(batch)
         if step_idx % self.grad_accum_steps == 0:
             self.opt.zero_grad()
+        window_size, do_step = accumulation_state(
+            step_idx, total_steps, self.grad_accum_steps,
+        )
         with torch.amp.autocast('cuda', enabled=self.amp):
-            z1 = self.projector(self.encoder(v1))
-            z2 = self.projector(self.encoder(v2))
+            h1 = self.encoder(v1)
+            h2 = self.encoder(v2)
+            z1 = self.projector(h1)
+            z2 = self.projector(h2)
             loss = self._swav_loss(z1, z2)
-            loss_scaled = loss / self.grad_accum_steps
-        self._last_z = torch.cat([z1.detach(), z2.detach()], dim=0)
+            loss_scaled = loss / window_size
+        self._last_z = torch.cat([h1.detach(), h2.detach()], dim=0)
         _params = (list(self.encoder.parameters()) +
                    list(self.projector.parameters()) +
                    list(self.prototypes.parameters()))
         if self.scaler:
             self.scaler.scale(loss_scaled).backward()
-            if (step_idx + 1) % self.grad_accum_steps == 0:
+            if do_step:
                 self.scaler.unscale_(self.opt)
                 nn.utils.clip_grad_norm_(_params, self.grad_clip_norm)
                 self.scaler.step(self.opt)
                 self.scaler.update()
         else:
             loss_scaled.backward()
-            if (step_idx + 1) % self.grad_accum_steps == 0:
+            if do_step:
                 nn.utils.clip_grad_norm_(_params, self.grad_clip_norm)
                 self.opt.step()
         with torch.no_grad():
@@ -101,4 +109,14 @@ class SwAVTrainer:
         sim = zn @ zn.t()
         n = z.shape[0]
         mask = ~torch.eye(n, device=z.device).bool()
-        return {'embed_std': embed_std, 'avg_cosine_sim': sim[mask].mean().item()}
+        assignments = self._last_assignments.float()
+        usage = assignments.mean(dim=0)
+        entropy = -(usage * usage.clamp_min(1e-12).log()).sum()
+        entropy /= torch.log(torch.tensor(float(len(usage)), device=usage.device))
+        occupied = (usage > (1.0 / len(usage)) * 0.1).float().mean()
+        return {
+            'embed_std': embed_std,
+            'avg_cosine_sim': sim[mask].mean().item(),
+            'prototype_entropy': entropy.item(),
+            'prototype_occupancy': occupied.item(),
+        }

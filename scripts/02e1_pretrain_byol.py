@@ -13,11 +13,12 @@ from ecg_ssl_utils.artifact import write_artifact_snapshot
 from ecg_ssl_utils.config import get_config
 from ecg_ssl_utils.models.projectors import BYOLProjector, MLPPredictor
 from ecg_ssl_utils.models.vit_small_1d import ViTSmall1D
-from ecg_ssl_utils.repro import make_deterministic_loader, parse_pretrain_seed, set_global_seed
+from ecg_ssl_utils.repro import (
+    checkpoint_runtime_state, make_deterministic_loader, parse_pretrain_seed,
+    restore_runtime_state, set_global_seed,
+)
 from ecg_ssl_utils.ssl.augmentations import ECGAugmentation
 from ecg_ssl_utils.ssl.byol import BYOLTrainer
-
-HEARTBEAT_EVERY = 20
 
 
 def _p(msg):
@@ -56,14 +57,15 @@ def main():
     start_epoch = 0
     ckpt_path = os.path.join(OUTPUT_DIR, "checkpoint.pt")
     if os.path.exists(ckpt_path):
-        ckpt = torch.load(ckpt_path, map_location=device)
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         encoder.load_state_dict(ckpt["encoder"])
         projector.load_state_dict(ckpt["projector"])
         predictor.load_state_dict(ckpt["predictor"])
         optimizer.load_state_dict(ckpt["optimizer"])
         start_epoch = ckpt["epoch"] + 1
-        for _ in range(start_epoch):
-            scheduler.step()
+        if "rng_state" not in ckpt:
+            for _ in range(start_epoch):
+                scheduler.step()
         _p(f"Resuming from epoch {start_epoch}")
 
     trainer = BYOLTrainer(
@@ -73,6 +75,11 @@ def main():
         grad_clip_norm=cfg.ssl_training.grad_clip_norm,
         grad_accum_steps=cfg.ssl_training.grad_accum_steps,
     )
+    if start_epoch:
+        if "target_encoder" in ckpt:
+            trainer.target_encoder.load_state_dict(ckpt["target_encoder"])
+            trainer.target_projector.load_state_dict(ckpt["target_projector"])
+        restore_runtime_state(ckpt, scheduler, trainer.scaler, loader)
     log = open(os.path.join(OUTPUT_DIR, "train_log.csv"), "a" if start_epoch else "w")
     if start_epoch == 0:
         log.write("epoch,loss,lr,time_s,embed_std,avg_cosine_sim\n")
@@ -81,7 +88,9 @@ def main():
     n_steps = len(loader)
     effective_batch = cfg.ssl_training.batch_size * cfg.ssl_training.grad_accum_steps
     _p(f"\nTraining BYOL for {cfg.ssl_training.epochs} epochs")
-    _p(f"  Batch size: {cfg.ssl_training.batch_size} × {cfg.ssl_training.grad_accum_steps} accum = {effective_batch} effective")
+    _p(f"  Physical batch: {cfg.ssl_training.batch_size}")
+    _p(f"  Optimizer accumulation: ×{cfg.ssl_training.grad_accum_steps} "
+       f"({effective_batch} samples/update except final partial window)")
     _p(f"  Steps/epoch: {n_steps} | AMP: {cfg.ssl_training.use_amp}")
     _p(f"  Warmup: {cfg.ssl_training.warmup_epochs} epochs")
     _p(f"  EMA momentum: {cfg.byol.ema_momentum_start} → {cfg.byol.ema_momentum_end}")
@@ -89,13 +98,12 @@ def main():
 
     for epoch in range(start_epoch, cfg.ssl_training.epochs):
         t0 = time.time()
-        _p(f"  Epoch {epoch:3d}/{cfg.ssl_training.epochs} starting ({n_steps} steps)")
         losses = []
         for i, b in enumerate(loader):
-            loss = trainer.train_step(b[0], epoch, step_idx=i)
+            loss = trainer.train_step(
+                b[0], epoch, step_idx=i, total_steps=n_steps,
+            )
             losses.append(loss)
-            if i == 0 or (i + 1) % HEARTBEAT_EVERY == 0 or (i + 1) == n_steps:
-                _p(f"    step {i + 1}/{n_steps} | loss {loss:.4f}")
         scheduler.step()
         metrics = trainer.compute_collapse_metrics()
         avg = np.mean(losses)
@@ -110,8 +118,10 @@ def main():
         if (epoch + 1) % cfg.ssl_training.checkpoint_every == 0:
             torch.save({"epoch": epoch, "encoder": encoder.state_dict(),
                         "projector": projector.state_dict(), "predictor": predictor.state_dict(),
-                        "optimizer": optimizer.state_dict()}, ckpt_path)
-            _p(f"  Saved checkpoint at epoch {epoch}")
+                        "target_encoder": trainer.target_encoder.state_dict(),
+                        "target_projector": trainer.target_projector.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        **checkpoint_runtime_state(scheduler, trainer.scaler, loader)}, ckpt_path)
     log.close()
     torch.save(trainer.online_encoder.state_dict(), os.path.join(OUTPUT_DIR, "encoder.pt"))
     snap = {"paradigm": "byol", "backbone": "vit_small_1d", "seed": seed, "sensitivity_arm": True}

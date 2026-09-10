@@ -6,6 +6,7 @@ Reference: Assran et al., CVPR 2023 (I-JEPA).
 """
 import torch, torch.nn as nn, copy, math
 from typing import Optional, List, Tuple
+from ecg_ssl_utils.repro import accumulation_state
 
 
 class JEPAPredictor(nn.Module):
@@ -153,17 +154,19 @@ class JEPATrainer:
         """Cosine EMA schedule: 0.996 → 1.0"""
         return 1 - (1 - self.ema_start) * 0.5 * (1 + math.cos(math.pi * epoch / self.total_epochs))
 
-    def train_step(self, batch, epoch=0, step_idx=0):
+    def train_step(self, batch, epoch=0, step_idx=0, total_steps=1):
         self.model.train()
         batch = batch.to(self.dev)
         if step_idx % self.grad_accum_steps == 0:
             self.opt.zero_grad()
+        window_size, do_step = accumulation_state(
+            step_idx, total_steps, self.grad_accum_steps,
+        )
         with torch.amp.autocast('cuda', enabled=self.amp):
             loss = self.model(batch)
-            loss_scaled = loss / self.grad_accum_steps
+            loss_scaled = loss / window_size
         _params = (list(self.model.context_encoder.parameters()) +
                    list(self.model.predictor.parameters()))
-        do_step = (step_idx + 1) % self.grad_accum_steps == 0
         if self.scaler:
             self.scaler.scale(loss_scaled).backward()
             if do_step:

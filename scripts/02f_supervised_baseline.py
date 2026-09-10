@@ -2,7 +2,7 @@
 """
 Script 02f — Supervised ViT-S baseline
 ======================================
-End-to-end supervised training on canonical superclass labels, same splits
+End-to-end supervised training on official PTB-XL superclass labels, same splits
 as SSL (folds 1–8 train, 9 val). Saved like SSL encoders so 03–07 pick it up.
 """
 import os, sys, json, time
@@ -19,12 +19,19 @@ if UTILS_DIR not in sys.path:
 from ecg_ssl_utils.artifact import write_artifact_snapshot
 from ecg_ssl_utils.config import get_config
 from ecg_ssl_utils.models.vit_small_1d import ViTSmall1D
-from ecg_ssl_utils.repro import make_deterministic_loader, parse_pretrain_seed, set_global_seed
+from ecg_ssl_utils.repro import (
+    accumulation_state,
+    checkpoint_runtime_state,
+    make_deterministic_loader,
+    parse_pretrain_seed,
+    restore_runtime_state,
+    set_global_seed,
+)
 
 
 def main():
     cfg = get_config()
-    seed = parse_pretrain_seed(42)
+    seed = parse_pretrain_seed(cfg.ssl_training.pretrain_seeds[0])
     set_global_seed(seed)
     OUTPUT_DIR = f"/kaggle/working/ssl-supervised-vit-small-seed{seed}"
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -58,14 +65,16 @@ def main():
     start_epoch, best_auroc, wait, best_enc = 0, 0.0, 0, None
     ckpt_path = os.path.join(OUTPUT_DIR, "checkpoint.pt")
     if os.path.exists(ckpt_path):
-        ckpt = torch.load(ckpt_path, map_location=device)
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         encoder.load_state_dict(ckpt["encoder"])
         head.load_state_dict(ckpt["head"])
         optimizer.load_state_dict(ckpt["optimizer"])
         start_epoch = ckpt["epoch"] + 1
         best_auroc = ckpt.get("best_auroc", 0.0)
-        for _ in range(start_epoch):
-            scheduler.step()
+        if "rng_state" not in ckpt:
+            for _ in range(start_epoch):
+                scheduler.step()
+        restore_runtime_state(ckpt, scheduler, scaler, loader)
 
     log = open(os.path.join(OUTPUT_DIR, "train_log.csv"), "a" if start_epoch else "w")
     if start_epoch == 0:
@@ -79,20 +88,24 @@ def main():
         optimizer.zero_grad()
         for i, (xb, yb) in enumerate(loader):
             xb, yb = xb.to(device), yb.to(device)
+            window_size, do_step = accumulation_state(
+                i, len(loader), cfg.ssl_training.grad_accum_steps,
+            )
             with torch.amp.autocast("cuda", enabled=cfg.ssl_training.use_amp):
-                loss = criterion(head(encoder(xb)), yb) / cfg.ssl_training.grad_accum_steps
+                raw_loss = criterion(head(encoder(xb)), yb)
+                loss = raw_loss / window_size
             if scaler:
                 scaler.scale(loss).backward()
-                if (i + 1) % cfg.ssl_training.grad_accum_steps == 0:
+                if do_step:
                     scaler.unscale_(optimizer)
                     nn.utils.clip_grad_norm_(params, cfg.ssl_training.grad_clip_norm)
                     scaler.step(optimizer); scaler.update(); optimizer.zero_grad()
             else:
                 loss.backward()
-                if (i + 1) % cfg.ssl_training.grad_accum_steps == 0:
+                if do_step:
                     nn.utils.clip_grad_norm_(params, cfg.ssl_training.grad_clip_norm)
                     optimizer.step(); optimizer.zero_grad()
-            losses.append(loss.item() * cfg.ssl_training.grad_accum_steps)
+            losses.append(raw_loss.item())
         scheduler.step()
 
         encoder.eval(); head.eval()
@@ -115,7 +128,8 @@ def main():
                 break
         if (epoch + 1) % cfg.ssl_training.checkpoint_every == 0:
             torch.save({"epoch": epoch, "encoder": encoder.state_dict(), "head": head.state_dict(),
-                        "optimizer": optimizer.state_dict(), "best_auroc": best_auroc}, ckpt_path)
+                        "optimizer": optimizer.state_dict(), "best_auroc": best_auroc,
+                        **checkpoint_runtime_state(scheduler, scaler, loader)}, ckpt_path)
 
     log.close()
     if best_enc:

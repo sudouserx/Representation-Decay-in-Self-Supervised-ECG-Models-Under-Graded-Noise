@@ -23,7 +23,10 @@ from ecg_ssl_utils.artifact import write_artifact_snapshot
 from ecg_ssl_utils.config import get_config
 from ecg_ssl_utils.models.projectors import MLPProjector
 from ecg_ssl_utils.models.vit_small_1d import ViTSmall1D
-from ecg_ssl_utils.repro import make_deterministic_loader, parse_pretrain_seed, set_global_seed
+from ecg_ssl_utils.repro import (
+    checkpoint_runtime_state, make_deterministic_loader, parse_pretrain_seed,
+    restore_runtime_state, set_global_seed,
+)
 from ecg_ssl_utils.ssl.augmentations import ECGAugmentation
 from ecg_ssl_utils.ssl.simclr import SimCLRTrainer
 
@@ -87,14 +90,15 @@ def main():
     start_epoch = 0
     ckpt_path = os.path.join(OUTPUT_DIR, 'checkpoint.pt')
     if os.path.exists(ckpt_path):
-        ckpt = torch.load(ckpt_path, map_location=device)
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         encoder.load_state_dict(ckpt['encoder'])
         projector.load_state_dict(ckpt['projector'])
         optimizer.load_state_dict(ckpt['optimizer'])
         start_epoch = ckpt['epoch'] + 1
         # Advance scheduler to the correct epoch
-        for _ in range(start_epoch):
-            scheduler.step()
+        if "rng_state" not in ckpt:
+            for _ in range(start_epoch):
+                scheduler.step()
         print(f"Resuming from epoch {start_epoch}")
 
     grad_accum_steps = cfg.ssl_training.grad_accum_steps
@@ -107,6 +111,8 @@ def main():
         grad_clip_norm=cfg.ssl_training.grad_clip_norm,
         grad_accum_steps=grad_accum_steps,
     )
+    if start_epoch:
+        restore_runtime_state(ckpt, scheduler, trainer.scaler, loader)
 
     # Training loop
     log_path = os.path.join(OUTPUT_DIR, 'train_log.csv')
@@ -114,11 +120,15 @@ def main():
     if start_epoch == 0:
         log_file.write('epoch,loss,lr,time_s,embed_std,avg_cosine_sim\n')
 
-    # Expected initial loss for reference
+    # Expected initial loss for the physical NT-Xent batch. Optimizer
+    # accumulation does not add negatives to the contrastive denominator.
     expected_init_loss = np.log(2 * cfg.ssl_training.batch_size - 1)
 
     print(f"\nTraining SimCLR for {total_epochs} epochs")
-    print(f"  Batch size: {cfg.ssl_training.batch_size} × {grad_accum_steps} accum = {effective_batch} effective")
+    print(f"  Physical contrastive batch: {cfg.ssl_training.batch_size} "
+          f"({2 * cfg.ssl_training.batch_size - 2} negatives/anchor)")
+    print(f"  Optimizer accumulation: ×{grad_accum_steps} "
+          f"({effective_batch} samples/update, except final partial window)")
     print(f"  Temperature: {cfg.simclr.temperature}")
     print(f"  Warmup: {warmup_epochs} epochs")
     print(f"  Grad clip norm: {cfg.ssl_training.grad_clip_norm}")
@@ -130,7 +140,7 @@ def main():
         t0 = time.time()
         losses = []
         for step_idx, (batch,) in enumerate(loader):
-            loss = trainer.train_step(batch, step_idx)
+            loss = trainer.train_step(batch, step_idx, total_steps=len(loader))
             losses.append(loss)
         scheduler.step()
 
@@ -172,6 +182,7 @@ def main():
             torch.save({
                 'epoch': epoch, 'encoder': encoder.state_dict(),
                 'projector': projector.state_dict(), 'optimizer': optimizer.state_dict(),
+                **checkpoint_runtime_state(scheduler, trainer.scaler, loader),
             }, ckpt_path)
 
     log_file.close()
@@ -182,6 +193,8 @@ def main():
                    'seed': seed, 'sensitivity_arm': False,
                    'epochs': cfg.ssl_training.epochs, 'batch_size': cfg.ssl_training.batch_size,
                    'effective_batch_size': effective_batch,
+                   'physical_contrastive_batch_size': cfg.ssl_training.batch_size,
+                   'negatives_per_anchor': 2 * cfg.ssl_training.batch_size - 2,
                    'lr': cfg.ssl_training.lr, 'temperature': cfg.simclr.temperature,
                    'warmup_epochs': warmup_epochs,
                    'grad_accum_steps': grad_accum_steps,
