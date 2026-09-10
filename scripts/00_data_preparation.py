@@ -3,7 +3,8 @@
 Script 00 — Data Preparation
 =============================
 Load PTB-XL, save raw splits, bandpass (0.05–45 Hz sosfiltfilt), normalize
-with train-only stats, encode canonical superclass labels.
+with train-only stats, and encode the official diagnostic-superclass labels.
+The former strict likelihood >50 construction is retained as a sensitivity arm.
 
 Kaggle Inputs:  PTB-XL dataset (e.g., 'khyeh0719/ptb-xl-dataset')
 Kaggle Output:  /kaggle/working/ptbxl_clean/ → publish as 'ptbxl-clean-processed'
@@ -98,36 +99,87 @@ def main():
     print(f"  SCP labels: {labels.shape}, avg {labels.sum(axis=1).mean():.2f}/record")
 
     scp_statements_path = os.path.join(PTBXL_DIR, "scp_statements.csv")
-    superclass_raw = None
-    superclass_canonical = None
+    superclass_official = None
+    superclass_sensitivity = None
     if os.path.exists(scp_statements_path):
-        superclass_raw = encode_superclass_labels(
-            metadata, scp_statements_path, threshold=0.0
+        superclass_official = encode_superclass_labels(
+            metadata, scp_statements_path, threshold=None
         )
-        superclass_canonical = encode_superclass_labels(
-            metadata, scp_statements_path, threshold=cfg.data.label_threshold
+        superclass_sensitivity = encode_superclass_labels(
+            metadata, scp_statements_path,
+            threshold=cfg.data.sensitivity_label_threshold,
         )
         print(f"  Superclass names: {SUPERCLASS_NAMES}")
         for i, name in enumerate(SUPERCLASS_NAMES):
             print(
-                f"    {name}: raw={int(superclass_raw[:, i].sum())} "
-                f"canonical(thr={cfg.data.label_threshold})={int(superclass_canonical[:, i].sum())}"
+                f"    {name}: official={int(superclass_official[:, i].sum())} "
+                f"sensitivity(>{cfg.data.sensitivity_label_threshold})="
+                f"{int(superclass_sensitivity[:, i].sum())}"
             )
     else:
         print(f"  WARNING: scp_statements.csv not found at {scp_statements_path}")
 
     if (
         cfg.data.exclude_no_superclass
-        and superclass_canonical is not None
+        and superclass_official is not None
     ):
-        keep = drop_empty_superclass_rows(superclass_canonical)
+        keep = drop_empty_superclass_rows(superclass_official)
         n_drop = int((~keep).sum())
-        print(f"  Excluding {n_drop} records with all-zero canonical superclass labels.")
+        legacy_empty = ~drop_empty_superclass_rows(superclass_sensitivity)
+        cohort_report = {
+            "definition": "official PTB-XL diagnostic superclass aggregation",
+            "n_input": int(len(metadata)),
+            "n_official_empty": n_drop,
+            "n_legacy_gt50_empty": int(legacy_empty.sum()),
+            "legacy_threshold": cfg.data.sensitivity_label_threshold,
+            "by_fold": {
+                str(fold): {
+                    "n": int((metadata["strat_fold"] == fold).sum()),
+                    "official_empty": int(((metadata["strat_fold"] == fold) & ~keep).sum()),
+                    "legacy_gt50_empty": int(((metadata["strat_fold"] == fold) & legacy_empty).sum()),
+                }
+                for fold in sorted(metadata["strat_fold"].unique())
+            },
+            "class_counts": {
+                name: {
+                    "official": int(superclass_official[:, i].sum()),
+                    "legacy_gt50": int(superclass_sensitivity[:, i].sum()),
+                }
+                for i, name in enumerate(SUPERCLASS_NAMES)
+            },
+        }
+        if "sex" in metadata:
+            cohort_report["by_sex"] = {
+                str(sex): {
+                    "n": int((metadata["sex"] == sex).sum()),
+                    "official_empty": int(((metadata["sex"] == sex) & ~keep).sum()),
+                    "legacy_gt50_empty": int(((metadata["sex"] == sex) & legacy_empty).sum()),
+                }
+                for sex in sorted(metadata["sex"].dropna().unique())
+            }
+        if "age" in metadata:
+            age_group = pd.cut(
+                metadata["age"], bins=[0, 40, 60, 80, np.inf],
+                labels=["0-40", "40-60", "60-80", "80+"],
+                include_lowest=True,
+            )
+            cohort_report["by_age"] = {
+                str(group): {
+                    "n": int((age_group == group).sum()),
+                    "official_empty": int(((age_group == group) & ~keep).sum()),
+                    "legacy_gt50_empty": int(((age_group == group) & legacy_empty).sum()),
+                }
+                for group in age_group.cat.categories
+            }
+        with open(os.path.join(OUTPUT_DIR, "cohort_definition.json"), "w") as f:
+            import json
+            json.dump(cohort_report, f, indent=2)
+        print(f"  Excluding {n_drop} records with no official diagnostic superclass.")
         signals = signals[keep]
         metadata = metadata.loc[keep].reset_index(drop=True)
         labels = labels[keep]
-        superclass_raw = superclass_raw[keep]
-        superclass_canonical = superclass_canonical[keep]
+        superclass_official = superclass_official[keep]
+        superclass_sensitivity = superclass_sensitivity[keep]
         print(f"  Remaining records: {len(metadata)}")
 
     print("\n" + "=" * 60)
@@ -179,16 +231,20 @@ def main():
     for split_name, idx in splits.items():
         np.save(os.path.join(OUTPUT_DIR, f"signals_{split_name}.npy"), filtered[idx])
         np.save(os.path.join(OUTPUT_DIR, f"labels_{split_name}.npy"), labels[idx])
-        if superclass_canonical is not None:
+        if superclass_official is not None:
             np.save(
                 os.path.join(OUTPUT_DIR, f"superclass_labels_{split_name}.npy"),
-                superclass_canonical[idx],
+                superclass_official[idx],
             )
             np.save(
                 os.path.join(OUTPUT_DIR, f"superclass_labels_raw_{split_name}.npy"),
-                superclass_raw[idx],
+                superclass_official[idx],
             )
-        extra = f", superclass {superclass_canonical[idx].shape}" if superclass_canonical is not None else ""
+            np.save(
+                os.path.join(OUTPUT_DIR, f"superclass_labels_likelihood_gt50_{split_name}.npy"),
+                superclass_sensitivity[idx],
+            )
+        extra = f", superclass {superclass_official[idx].shape}" if superclass_official is not None else ""
         print(f"  {split_name}: signals {filtered[idx].shape}, labels {labels[idx].shape}{extra}")
 
     metadata.to_parquet(os.path.join(OUTPUT_DIR, "metadata.parquet"), index=False)
@@ -204,7 +260,8 @@ def main():
             "n_test": int(len(splits["test"])),
             "n_records_after_exclusion": int(len(metadata)),
             "n_patients_after_exclusion": int(metadata["patient_id"].nunique()),
-            "label_threshold": cfg.data.label_threshold,
+            "label_definition": "official_all_diagnostic_statements",
+            "sensitivity_label_threshold_strict_gt": cfg.data.sensitivity_label_threshold,
             "ptbxl_version": cfg.data.ptbxl_version,
             "filter": "sosfiltfilt",
         },

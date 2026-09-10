@@ -31,7 +31,8 @@ class DataConfig:
     bandpass_low: float = 0.05          # Hz (diagnostic-mode; preserves ST segments)
     bandpass_high: float = 45.0         # Hz
     filter_order: int = 4
-    label_threshold: float = 50.0       # PTB-XL likelihood threshold for canonical labels
+    label_threshold: Optional[float] = None  # official PTB-XL: map every diagnostic statement
+    sensitivity_label_threshold: float = 50.0  # legacy strict >50 sensitivity cohort
     exclude_no_superclass: bool = True  # drop records with all-zero superclass vector
     strict_dataset: bool = True         # assert N==21799 and 18869 unique patients
     expected_n_records: int = 21799
@@ -100,7 +101,7 @@ class SSLTrainingConfig:
     checkpoint_every: int = 20
     num_workers: int = 4
     pin_memory: bool = True
-    grad_accum_steps: int = 4            # effective batch = 256 × 4 = 1024
+    grad_accum_steps: int = 4            # optimizer accumulation; does not add contrastive negatives
     grad_clip_norm: float = 1.0          # max gradient norm for clipping
     pretrain_seeds: List[int] = field(default_factory=lambda: [42, 123, 456])
 
@@ -210,6 +211,8 @@ class EvalConfig:
     ])
     delong_alpha: float = 0.05
     collapse_var_guard: float = 1e-6    # CKA returns nan below this column-std
+    primary_snr_db: float = 0.0
+    primary_noise_types: List[str] = field(default_factory=lambda: ['bw', 'ma', 'em'])
 
 
 # ──────────────────────────────────────────────────────────────

@@ -122,12 +122,13 @@ def get_superclass_mapping(scp_statements_path: str) -> Dict[str, str]:
     """
     df = pd.read_csv(scp_statements_path, index_col=0)
     mapping = {}
-    for code in df.index:
-        # diagnostic_class column contains the superclass
-        if 'diagnostic_class' in df.columns:
-            superclass = df.loc[code, 'diagnostic_class']
-            if pd.notna(superclass):
-                mapping[code] = superclass
+    if 'diagnostic' not in df.columns:
+        raise ValueError("scp_statements.csv is missing the 'diagnostic' column")
+    diagnostic = df['diagnostic'].fillna(0).astype(float) == 1.0
+    for code, row in df.loc[diagnostic].iterrows():
+        superclass = row.get('diagnostic_class')
+        if pd.notna(superclass):
+            mapping[code] = superclass
     return mapping
 
 
@@ -141,7 +142,7 @@ def drop_empty_superclass_rows(
 def encode_superclass_labels(
     metadata: pd.DataFrame,
     scp_statements_path: str,
-    threshold: float = 50.0,
+    threshold: Optional[float] = None,
 ) -> np.ndarray:
     """
     Encode SCP codes as 5-class superclass multi-hot vectors.
@@ -156,9 +157,10 @@ def encode_superclass_labels(
         Must have 'scp_codes' column with dict values {code: likelihood}.
     scp_statements_path : str
         Path to scp_statements.csv from PTB-XL dataset.
-    threshold : float
-        Minimum likelihood to include a label (PTB-XL uses 0-100 scale).
-        Default 50.0 matches the canonical PTB-XL benchmark construction.
+    threshold : float, optional
+        Custom strict likelihood cutoff (``likelihood > threshold``). ``None``
+        is the official PTB-XL diagnostic-superclass construction: every
+        listed diagnostic SCP statement is mapped regardless of likelihood.
 
     Returns
     -------
@@ -175,7 +177,9 @@ def encode_superclass_labels(
     for i, codes_dict in enumerate(metadata['scp_codes']):
         if isinstance(codes_dict, dict):
             for code, likelihood in codes_dict.items():
-                if code in code_to_super and likelihood > threshold:
+                if code in code_to_super and (
+                    threshold is None or likelihood > threshold
+                ):
                     superclass = code_to_super[code]
                     if superclass in super_to_idx:
                         labels[i, super_to_idx[superclass]] = 1.0
