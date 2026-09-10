@@ -27,13 +27,13 @@ def test_effective_rank_full_rank():
     assert 5 < er <= 10
 
 
-def test_ece_threshold_definition_golden():
-    """OvR ECE uses 0.5-threshold accuracy; fully-correct 0.1/0.9 probs → 0.5."""
+def test_ece_binary_confidence_golden():
+    """Perfect 0.1/0.9 predictions have confidence 0.9 and ECE 0.1."""
     y = np.zeros((200, 1))
     y[:100, 0] = 1
     p = np.where(y == 1, 0.9, 0.1).astype(float)
     ece = expected_calibration_error(y, p, n_bins=10)
-    assert abs(ece - 0.5) < 1e-6
+    assert abs(ece - 0.1) < 1e-6
 
 
 def test_bootstrap_returns_full_sample_point():

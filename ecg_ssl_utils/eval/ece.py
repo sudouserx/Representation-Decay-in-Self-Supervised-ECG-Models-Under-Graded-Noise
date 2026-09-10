@@ -3,8 +3,8 @@ Expected Calibration Error (ECE).
 ECE = Σ (|B_m|/n) · |acc(B_m) - conf(B_m)|
 Reference: Guo et al., ICML 2017.
 
-OvR sigmoid outputs, 15-bin default. Accuracy inside a bin uses a 0.5
-threshold (threshold-dependent; documented). Equal-width is primary;
+OvR sigmoid outputs, 15-bin default. Confidence is the probability assigned
+to the predicted binary class, ``max(p, 1-p)``. Equal-width is primary;
 equal-mass (quantile) bins are an optional robustness check.
 """
 import numpy as np
@@ -40,8 +40,10 @@ def expected_calibration_error(
     for c in range(C):
         if y_true[:, c].sum() < 1:
             continue
-        probs = y_prob[:, c]
-        correct = (y_true[:, c] == (probs >= 0.5).astype(float)).astype(float)
+        positive_probs = y_prob[:, c]
+        predictions = (positive_probs >= 0.5).astype(float)
+        correct = (y_true[:, c] == predictions).astype(float)
+        probs = np.maximum(positive_probs, 1.0 - positive_probs)
         if binning == "equal_mass":
             quantiles = np.linspace(0, 1, n_bins + 1)
             edges = np.unique(np.quantile(probs, quantiles))

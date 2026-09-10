@@ -21,7 +21,7 @@ class LinearProbe(nn.Module):
 
 def train_probe(representations, labels, val_repr, val_labels,
                 in_dim=384, n_classes=71, epochs=50, batch_size=512,
-                lr=1e-2, patience=10, device='cuda'):
+                lr=1e-2, patience=10, device='cuda', seed=42):
     """Train linear probe on frozen representations. Returns probe + metrics."""
     probe = LinearProbe(in_dim, n_classes).to(device)
     opt = torch.optim.Adam(probe.parameters(), lr=lr)
@@ -34,7 +34,10 @@ def train_probe(representations, labels, val_repr, val_labels,
     val_l = torch.tensor(val_labels, dtype=torch.float32).to(device)
 
     ds = torch.utils.data.TensorDataset(reps_t, labs_t)
-    dl = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True)
+    generator = torch.Generator().manual_seed(seed)
+    dl = torch.utils.data.DataLoader(
+        ds, batch_size=batch_size, shuffle=True, generator=generator,
+    )
 
     best_auroc, wait, best_state = 0, 0, None
     for ep in range(epochs):
