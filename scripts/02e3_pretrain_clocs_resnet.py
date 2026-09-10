@@ -16,6 +16,12 @@ from ecg_ssl_utils.models.resnet18_1d import ResNet18_1D
 from ecg_ssl_utils.repro import make_deterministic_loader, parse_pretrain_seed, set_global_seed
 from ecg_ssl_utils.ssl.clocs import CLOCSTrainer
 
+HEARTBEAT_EVERY = 20
+
+
+def _p(msg):
+    print(msg, flush=True)
+
 
 def main():
     cfg = get_config()
@@ -24,8 +30,12 @@ def main():
     OUTPUT_DIR = f"/kaggle/working/ssl-clocs-resnet18-seed{seed}"
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    _p(f"Device: {device} | seed: {seed}")
+    _p(f"Output dir: {OUTPUT_DIR}")
 
+    _p("Loading training signals...")
     signals = np.load(os.path.join(CLEAN_DIR, "signals_train.npy"))
+    _p(f"Training signals: {signals.shape}")
     meta = pd.read_parquet(os.path.join(CLEAN_DIR, "metadata.parquet"))
     pids = torch.tensor(meta[meta["split"] == "train"].reset_index(drop=True)["patient_id"].values, dtype=torch.long)
     loader = make_deterministic_loader(
@@ -52,6 +62,7 @@ def main():
         start_epoch = ckpt["epoch"] + 1
         for _ in range(start_epoch):
             scheduler.step()
+        _p(f"Resuming from epoch {start_epoch}")
 
     trainer = CLOCSTrainer(
         encoder, projector, optimizer, scheduler,
@@ -66,24 +77,48 @@ def main():
     log = open(os.path.join(OUTPUT_DIR, "train_log.csv"), "a" if start_epoch else "w")
     if start_epoch == 0:
         log.write("epoch,loss,lr,time_s,embed_std,avg_cosine_sim\n")
+    log.flush()
+
+    n_steps = len(loader)
+    effective_batch = cfg.ssl_training.batch_size * cfg.ssl_training.grad_accum_steps
+    _p(f"\nTraining CLOCS-ResNet18 for {cfg.ssl_training.epochs} epochs")
+    _p(f"  Batch size: {cfg.ssl_training.batch_size} × {cfg.ssl_training.grad_accum_steps} accum = {effective_batch} effective")
+    _p(f"  Steps/epoch: {n_steps} | AMP: {cfg.ssl_training.use_amp}")
+    _p(f"  Temperature: {cfg.clocs.temperature}")
+    _p(f"  Warmup: {cfg.ssl_training.warmup_epochs} epochs")
+    _p(f"  Grad clip norm: {cfg.ssl_training.grad_clip_norm}")
+
     for epoch in range(start_epoch, cfg.ssl_training.epochs):
         t0 = time.time()
-        losses = [trainer.train_step(b[0], b[1], step_idx=i)["total"] for i, b in enumerate(loader)]
+        _p(f"  Epoch {epoch:3d}/{cfg.ssl_training.epochs} starting ({n_steps} steps)")
+        losses = []
+        for i, b in enumerate(loader):
+            loss = trainer.train_step(b[0], b[1], step_idx=i)["total"]
+            losses.append(loss)
+            if i == 0 or (i + 1) % HEARTBEAT_EVERY == 0 or (i + 1) == n_steps:
+                _p(f"    step {i + 1}/{n_steps} | loss {loss:.4f}")
         scheduler.step()
         metrics = trainer.compute_collapse_metrics()
-        log.write(f"{epoch},{np.mean(losses):.6f},{optimizer.param_groups[0]['lr']:.8f},"
-                  f"{time.time()-t0:.1f},{metrics['embed_std']:.6f},{metrics['avg_cosine_sim']:.6f}\n")
+        avg = np.mean(losses)
+        lr = optimizer.param_groups[0]["lr"]
+        elapsed = time.time() - t0
+        log.write(f"{epoch},{avg:.6f},{lr:.8f},{elapsed:.1f},"
+                  f"{metrics['embed_std']:.6f},{metrics['avg_cosine_sim']:.6f}\n")
         log.flush()
+        if epoch % 10 == 0 or epoch < 5 or epoch == cfg.ssl_training.epochs - 1:
+            _p(f"  Epoch {epoch:3d} | Loss: {avg:.4f} | LR: {lr:.6f} | {elapsed:.0f}s | "
+               f"std: {metrics['embed_std']:.4f} | cos_sim: {metrics['avg_cosine_sim']:.4f}")
         if (epoch + 1) % cfg.ssl_training.checkpoint_every == 0:
             torch.save({"epoch": epoch, "encoder": encoder.state_dict(),
                         "projector": projector.state_dict(),
                         "optimizer": optimizer.state_dict()}, ckpt_path)
+            _p(f"  Saved checkpoint at epoch {epoch}")
     log.close()
     torch.save(encoder.state_dict(), os.path.join(OUTPUT_DIR, "encoder.pt"))
     snap = {"paradigm": "clocs_adapted", "backbone": "resnet18_1d", "seed": seed, "sensitivity_arm": True}
     json.dump(snap, open(os.path.join(OUTPUT_DIR, "config.json"), "w"), indent=2)
     write_artifact_snapshot(OUTPUT_DIR, cfg, seed=seed, extra=snap, filename="run_snapshot.json")
-    print(f"✓ CLOCS-ResNet18 sensitivity arm saved to {OUTPUT_DIR}")
+    _p(f"\n✓ CLOCS-ResNet18 sensitivity arm saved to {OUTPUT_DIR}")
 
 
 if __name__ == "__main__":
