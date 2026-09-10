@@ -3,9 +3,10 @@
 Script 05 — Decay Metrics
 =========================
 Paired clean-vs-noisy AUROC, PR-AUC, F1 (val-tuned thresholds), ECE, Brier,
-CKA, effective rank. Patient-clustered bootstrap CIs on noise-seed-averaged
-predictions. Stouffer combination across noise seeds; BH over the declared
-family {paradigm × noise-type × class}. DeLong retained as appendix only.
+CKA, effective rank. Patient-clustered bootstrap CIs and paired tests operate
+on noise-seed-averaged predictions. Geometry is computed for each noise seed
+and then summarized; dependent noise realizations are never combined as if
+they were independent. DeLong is retained as appendix only.
 
 Kaggle Inputs:  ptbxl-clean-processed, corruption-eval-results, linear-probes-all
 Kaggle Output:  /kaggle/working/decay-metrics-results/
@@ -32,7 +33,6 @@ from ecg_ssl_utils.eval.auroc import macro_auroc, subgroup_auroc
 from ecg_ssl_utils.eval.bootstrap import (
     patient_bootstrap_ci,
     patient_bootstrap_pvalue,
-    stouffer_combine,
 )
 from ecg_ssl_utils.eval.cka import linear_cka
 from ecg_ssl_utils.eval.delong import delong_test
@@ -87,6 +87,10 @@ def _metric_bundle(labels, preds, reps, clean_reps, class_names, thresholds, cfg
         labels, preds, n_bins=cfg.eval.ece_bins, binning="equal_mass",
     ) if cfg.eval.ece_equal_mass else float("nan")
     f1 = per_class_f1(labels, preds, threshold=thresholds, class_names=class_names)
+    f1_fixed = per_class_f1(
+        labels, preds, threshold=np.full(n_classes, 0.5),
+        class_names=class_names,
+    )
     prauc = per_class_pr_auc(labels, preds, min_positives=cfg.eval.min_class_positives, class_names=class_names)
     brier = per_class_brier(labels, preds, class_names=class_names)
     cka, collapsed = linear_cka(clean_reps, reps, var_guard=cfg.eval.collapse_var_guard, return_collapse_flag=True)
@@ -96,6 +100,7 @@ def _metric_bundle(labels, preds, reps, clean_reps, class_names, thresholds, cfg
         "ece": ece,
         "ece_equal_mass": ece_em,
         "f1_macro": f1["macro"],
+        "f1_macro_fixed_0_5": f1_fixed["macro"],
         "prauc_macro": prauc["macro"],
         "brier_macro": brier["macro"],
         "cka": cka,
@@ -231,7 +236,7 @@ def main():
         pred_stack = np.stack([p for _, _, p in items], axis=0)
         rep_stack = np.stack([r for _, r, _ in items], axis=0)
         avg_preds = pred_stack.mean(axis=0)
-        avg_reps = rep_stack.mean(axis=0)
+        seed_geometry = []
 
         for seed, reps, preds in items:
             bundle = _metric_bundle(labels_test, preds, reps, clean_reps, class_names, thresholds, cfg, pids)
@@ -240,28 +245,47 @@ def main():
                 "noise_type": ntype, "snr_db": snr, "noise_seed": seed, **bundle,
             }
             per_seed_rows.append(row)
+            seed_geometry.append((bundle["cka"], bundle["erank"]))
 
-            for c in range(n_classes):
-                c_name = class_names[c] if class_names else str(c)
-                def _delta(idx, _c=c, _preds=preds):
-                    return _per_class_auroc(labels_test[idx], clean_preds[idx], _c) - _per_class_auroc(labels_test[idx], _preds[idx], _c)
-                try:
-                    dlt, pval = patient_bootstrap_pvalue(_delta, pids, n_bootstrap=cfg.eval.bootstrap_n, seed=cfg.eval.bootstrap_seed)
-                except Exception:
-                    dlt, pval = float("nan"), 1.0
-                delong_p = np.nan
-                try:
-                    if labels_test[:, c].sum() >= cfg.eval.min_class_positives:
-                        _, delong_p, _, _ = delong_test(labels_test[:, c], clean_preds[:, c], preds[:, c])
-                except Exception:
-                    pass
-                test_rows.append({
-                    "encoder": enc, "pretrain_seed": pretrain_seed, "noise_type": ntype,
-                    "snr_db": snr, "noise_seed": seed, "class": c_name,
-                    "delta_auroc": dlt, "bootstrap_p": pval, "delong_p": delong_p,
-                })
+        # Prediction metrics are computed after averaging repeated corruption
+        # realizations. Geometry remains per-realization and is summarized.
+        bundle = _metric_bundle(
+            labels_test, avg_preds, rep_stack[0], clean_reps,
+            class_names, thresholds, cfg, pids,
+        )
+        bundle["cka"] = float(np.nanmean([g[0] for g in seed_geometry]))
+        bundle["erank"] = float(np.nanmean([g[1] for g in seed_geometry]))
+        bundle["cka_noise_seed_sd"] = float(np.nanstd([g[0] for g in seed_geometry]))
+        bundle["erank_noise_seed_sd"] = float(np.nanstd([g[1] for g in seed_geometry]))
 
-        bundle = _metric_bundle(labels_test, avg_preds, avg_reps, clean_reps, class_names, thresholds, cfg, pids)
+        for c in range(n_classes):
+            c_name = class_names[c] if class_names else str(c)
+            def _delta(idx, _c=c):
+                return (
+                    _per_class_auroc(labels_test[idx], clean_preds[idx], _c)
+                    - _per_class_auroc(labels_test[idx], avg_preds[idx], _c)
+                )
+            try:
+                dlt, pval = patient_bootstrap_pvalue(
+                    _delta, pids, n_bootstrap=cfg.eval.bootstrap_n,
+                    seed=cfg.eval.bootstrap_seed,
+                )
+            except Exception:
+                dlt, pval = float("nan"), 1.0
+            delong_p = np.nan
+            try:
+                if labels_test[:, c].sum() >= cfg.eval.min_class_positives:
+                    _, delong_p, _, _ = delong_test(
+                        labels_test[:, c], clean_preds[:, c], avg_preds[:, c],
+                    )
+            except Exception:
+                pass
+            test_rows.append({
+                "encoder": enc, "pretrain_seed": pretrain_seed,
+                "noise_type": ntype, "snr_db": snr, "class": c_name,
+                "delta_auroc": dlt, "bootstrap_p": pval,
+                "delong_p": delong_p, "n_noise_seeds": len(items),
+            })
         _, auc_lo, auc_hi = patient_bootstrap_ci(
             lambda idx: macro_auroc(labels_test[idx], avg_preds[idx]),
             pids, n_bootstrap=cfg.eval.bootstrap_n, seed=cfg.eval.bootstrap_seed,
@@ -273,17 +297,23 @@ def main():
             point_estimate=bundle["ece"],
         )
         _, cka_lo, cka_hi = patient_bootstrap_ci(
-            lambda idx: linear_cka(clean_reps[idx], avg_reps[idx], var_guard=cfg.eval.collapse_var_guard),
+            lambda idx: np.nanmean([
+                linear_cka(clean_reps[idx], reps[idx], var_guard=cfg.eval.collapse_var_guard)
+                for reps in rep_stack
+            ]),
             pids, n_bootstrap=cfg.eval.bootstrap_n, seed=cfg.eval.bootstrap_seed,
             point_estimate=bundle["cka"] if not np.isnan(bundle["cka"]) else 0.0,
         )
 
         def _er(idx):
-            sub = avg_reps[idx]
-            if len(sub) > cfg.eval.er_bootstrap_subsample:
-                rng = np.random.RandomState(cfg.eval.bootstrap_seed)
-                sub = sub[rng.choice(len(sub), cfg.eval.er_bootstrap_subsample, replace=False)]
-            return effective_rank(sub, n_components=64, seed=cfg.eval.bootstrap_seed)
+            vals = []
+            for reps in rep_stack:
+                sub = reps[idx]
+                if len(sub) > cfg.eval.er_bootstrap_subsample:
+                    rng = np.random.RandomState(cfg.eval.bootstrap_seed)
+                    sub = sub[rng.choice(len(sub), cfg.eval.er_bootstrap_subsample, replace=False)]
+                vals.append(effective_rank(sub, n_components=64, seed=cfg.eval.bootstrap_seed))
+            return float(np.nanmean(vals))
 
         _, er_lo, er_hi = patient_bootstrap_ci(
             _er, pids, n_bootstrap=cfg.eval.er_bootstrap_n, seed=cfg.eval.bootstrap_seed,
@@ -306,30 +336,32 @@ def main():
     df_tests = pd.DataFrame(test_rows)
 
     if not df_tests.empty:
-        combined = []
-        for keys, g in df_tests.groupby(["encoder", "noise_type", "snr_db", "class"]):
-            pvals = g["bootstrap_p"].dropna().values
-            if len(pvals) == 0:
-                z, p = np.nan, 1.0
-            else:
-                z, p = stouffer_combine(pvals, two_sided=True)
-            combined.append({
-                "encoder": keys[0], "noise_type": keys[1], "snr_db": keys[2], "class": keys[3],
-                "stouffer_z": z, "stouffer_p": p,
-                "delta_auroc_mean": float(g["delta_auroc"].mean()),
-                "delong_p_median": float(np.nanmedian(g["delong_p"])),
-                "n_noise_seeds": len(g),
-            })
-        df_combined = pd.DataFrame(combined)
-        family = df_combined.copy()
-        family_size = len(family)
-        family["stouffer_p_bh"] = _bh_adjust(family["stouffer_p"].fillna(1.0).values)
-        family.to_parquet(os.path.join(OUTPUT_DIR, "hypothesis_tests.parquet"), index=False)
+        # Prespecified primary family: empirical NSTDB noise at one SNR.
+        # Other rows remain available as explicitly exploratory tests.
+        primary_mask = (
+            df_tests["noise_type"].isin(cfg.eval.primary_noise_types)
+            & np.isclose(df_tests["snr_db"], cfg.eval.primary_snr_db)
+        )
+        df_tests["primary_family"] = primary_mask
+        df_tests["bootstrap_p_bh"] = np.nan
+        if primary_mask.any():
+            df_tests.loc[primary_mask, "bootstrap_p_bh"] = _bh_adjust(
+                df_tests.loc[primary_mask, "bootstrap_p"].fillna(1.0).values
+            )
+        family_size = int(primary_mask.sum())
+        df_tests.to_parquet(
+            os.path.join(OUTPUT_DIR, "hypothesis_tests.parquet"), index=False,
+        )
         family_note = {
-            "family": "paradigm × noise-type × class (per SNR row kept; BH applied to all rows in this table)",
-            "n_tests": int(family_size),
-            "method": "patient-clustered bootstrap ΔAUROC per noise-seed; Stouffer combine; BH-FDR",
+            "family": {
+                "noise_types": cfg.eval.primary_noise_types,
+                "snr_db": cfg.eval.primary_snr_db,
+                "dimensions": "encoder × noise-type × class",
+            },
+            "n_tests": family_size,
+            "method": "paired patient-clustered bootstrap on noise-seed-averaged predictions; BH-FDR within primary family",
             "delong": "appendix only; independence assumption violated by multi-record patients",
+            "exploratory": "all other SNR/noise rows are saved without multiplicity-adjusted claims",
         }
         with open(os.path.join(OUTPUT_DIR, "bh_family.json"), "w") as f:
             json.dump(family_note, f, indent=2)
@@ -348,7 +380,10 @@ def main():
             summary.columns = ["_".join([c for c in col if c]).strip("_") for col in summary.columns]
             summary.to_parquet(os.path.join(OUTPUT_DIR, "pretrain_seed_summary.parquet"), index=False)
 
-    write_artifact_snapshot(OUTPUT_DIR, cfg, extra={"stats": "clustered_bootstrap_stouffer_bh"})
+    write_artifact_snapshot(
+        OUTPUT_DIR, cfg,
+        extra={"stats": "patient_clustered_bootstrap_seed_averaged_bh"},
+    )
     print("✓ Decay metrics computed!")
 
 

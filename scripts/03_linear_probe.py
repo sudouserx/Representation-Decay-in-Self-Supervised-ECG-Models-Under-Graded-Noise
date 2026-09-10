@@ -22,7 +22,9 @@ OUTPUT_DIR = "/kaggle/working/linear-probes-all"
 if UTILS_DIR not in sys.path:
     sys.path.insert(0, UTILS_DIR)
 
-from ecg_ssl_utils.artifact import write_artifact_snapshot
+from ecg_ssl_utils.artifact import (
+    build_model_manifest, file_sha256, write_artifact_snapshot,
+)
 from ecg_ssl_utils.config import get_config
 from ecg_ssl_utils.eval.ece import expected_calibration_error
 from ecg_ssl_utils.eval.f1 import per_class_f1
@@ -117,6 +119,17 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     unique_models = discover_models()
+    model_manifest = build_model_manifest(
+        unique_models, cfg.ssl_training.pretrain_seeds,
+    )
+    cohort_path = os.path.join(CLEAN_DIR, "cohort_definition.json")
+    if not os.path.exists(cohort_path):
+        raise FileNotFoundError(
+            "cohort_definition.json missing; rebuild data with script 00",
+        )
+    model_manifest["cohort_definition_sha256"] = file_sha256(cohort_path)
+    with open(os.path.join(OUTPUT_DIR, "model_manifest.json"), "w") as f:
+        json.dump(model_manifest, f, indent=2)
     signals_train = np.load(os.path.join(CLEAN_DIR, "signals_train.npy"))
     signals_val = np.load(os.path.join(CLEAN_DIR, "signals_val.npy"))
     signals_test = np.load(os.path.join(CLEAN_DIR, "signals_test.npy"))
@@ -142,6 +155,7 @@ def main():
             in_dim=cfg.backbone.embed_dim, n_classes=n_classes,
             epochs=cfg.probe.epochs, batch_size=cfg.probe.batch_size,
             lr=cfg.probe.lr, patience=cfg.probe.patience, device=device,
+            seed=cfg.eval.bootstrap_seed,
         )
 
         probe.eval()

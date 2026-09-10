@@ -16,6 +16,7 @@ import sys
 import numpy as np
 import pandas as pd
 import torch
+from scipy.signal import welch
 
 CLEAN_DIR = os.environ.get("CLEAN_DIR", "/kaggle/input/ptbxl-clean-processed")
 NOISE_DIR = os.environ.get("NOISE_DIR", "/kaggle/input/noisy-ecg-bank")
@@ -25,12 +26,12 @@ OUTPUT_DIR = "/kaggle/working/corruption-eval-results"
 if UTILS_DIR not in sys.path:
     sys.path.insert(0, UTILS_DIR)
 
-from ecg_ssl_utils.artifact import write_artifact_snapshot
+from ecg_ssl_utils.artifact import file_sha256, write_artifact_snapshot
 from ecg_ssl_utils.config import get_config
 from ecg_ssl_utils.data.preprocessing import bandpass_filter, load_norm_stats, normalize_signals
 from ecg_ssl_utils.models.resnet18_1d import ResNet18_1D
 from ecg_ssl_utils.models.vit_small_1d import ViTSmall1D
-from ecg_ssl_utils.noise.injection import inject_noise
+from ecg_ssl_utils.noise.injection import compute_snr, inject_noise
 from ecg_ssl_utils.probe.linear_probe import LinearProbe
 
 
@@ -87,13 +88,16 @@ def preprocess_noisy(noisy, cfg, norm_stats):
         fs=cfg.data.sampling_rate,
         order=cfg.data.filter_order,
     )
-    return normalize_signals(filtered, norm_stats["mean"], norm_stats["std"])
+    normalized = normalize_signals(filtered, norm_stats["mean"], norm_stats["std"])
+    return filtered, normalized
 
 
-def process_condition(raw_signals, manifest_subset, noise_bank, encoder, probe,
+def process_condition(raw_signals, clean_filtered, manifest_subset, noise_bank, encoder, probe,
                       device, cfg, norm_stats, batch_size=256):
     N = len(raw_signals)
     reps, probs = [], []
+    snr_pre, snr_post = [], []
+    psd_pre, psd_post, psd_freq = [], [], None
     for i in range(0, N, batch_size):
         batch_raw = raw_signals[i:i + batch_size]
         batch_manifest = manifest_subset.iloc[i:i + batch_size]
@@ -108,14 +112,35 @@ def process_condition(raw_signals, manifest_subset, noise_bank, encoder, probe,
                 batch_raw[j], noise_bank, row["noise_type"], row["snr_db"],
                 row["seed"], int(row["record_id"]), mixed_types, mixed_weights,
             )
-            batch_proc.append(preprocess_noisy(noisy, cfg, norm_stats))
+            filtered, normalized = preprocess_noisy(noisy, cfg, norm_stats)
+            batch_proc.append(normalized)
+            snr_pre.append(compute_snr(batch_raw[j], noisy))
+            snr_post.append(compute_snr(clean_filtered[i + j], filtered))
+            if i + j < 32:
+                psd_freq, p_pre = welch(
+                    (noisy - batch_raw[j]).mean(axis=0),
+                    fs=cfg.data.sampling_rate, nperseg=1024,
+                )
+                _, p_post = welch(
+                    (filtered - clean_filtered[i + j]).mean(axis=0),
+                    fs=cfg.data.sampling_rate, nperseg=1024,
+                )
+                psd_pre.append(p_pre)
+                psd_post.append(p_post)
         x = torch.tensor(np.stack(batch_proc), dtype=torch.float32).to(device)
         with torch.no_grad():
             h = encoder(x)
             p = probe.predict_proba(h)
             reps.append(h.cpu().numpy().astype(np.float32))
             probs.append(p.cpu().numpy().astype(np.float32))
-    return np.vstack(reps), np.vstack(probs)
+    return (
+        np.vstack(reps), np.vstack(probs),
+        np.asarray(snr_pre, dtype=np.float32),
+        np.asarray(snr_post, dtype=np.float32),
+        np.asarray(psd_freq, dtype=np.float32),
+        np.mean(psd_pre, axis=0).astype(np.float32),
+        np.mean(psd_post, axis=0).astype(np.float32),
+    )
 
 
 def main():
@@ -129,6 +154,13 @@ def main():
             f"{raw_path} missing. Re-run script 00 to save unfiltered test signals."
         )
     test_signals = np.load(raw_path)
+    clean_filtered = bandpass_filter(
+        test_signals,
+        low=cfg.data.bandpass_low,
+        high=cfg.data.bandpass_high,
+        fs=cfg.data.sampling_rate,
+        order=cfg.data.filter_order,
+    )
     norm_stats = load_norm_stats(os.path.join(CLEAN_DIR, "norm_stats.json"))
     meta = pd.read_parquet(os.path.join(CLEAN_DIR, "metadata.parquet"))
     test_meta = meta[meta["split"] == "test"].reset_index(drop=True)
@@ -137,6 +169,22 @@ def main():
     manifest = pd.read_parquet(os.path.join(NOISE_DIR, "noise_manifest.parquet"))
     noise_bank = load_noise_bank()
     models = get_model_dirs()
+    manifest_path = os.path.join(PROBE_DIR, "model_manifest.json")
+    if not os.path.exists(manifest_path):
+        raise FileNotFoundError("model_manifest.json missing; rerun script 03")
+    model_manifest = json.load(open(manifest_path))
+    cohort_path = os.path.join(CLEAN_DIR, "cohort_definition.json")
+    if file_sha256(cohort_path) != model_manifest.get("cohort_definition_sha256"):
+        raise RuntimeError("clean-data cohort does not match the probe manifest")
+    expected_models = {row["name"]: row for row in model_manifest["models"]}
+    missing = sorted(set(expected_models) - set(models))
+    if missing:
+        raise RuntimeError(f"models from probe manifest are not mounted: {missing}")
+    models = {name: models[name] for name in expected_models}
+    for name, directory in models.items():
+        actual = file_sha256(os.path.join(directory, "encoder.pt"))
+        if actual != expected_models[name]["encoder_sha256"]:
+            raise RuntimeError(f"encoder hash mismatch for {name}")
     conditions = manifest.groupby(["noise_type", "snr_db", "seed"])
 
     probe_metrics_path = os.path.join(PROBE_DIR, "probe_metrics.json")
@@ -161,8 +209,8 @@ def main():
 
             enc_hash_before = hash_parameters(encoder)
             probe_hash_before = hash_parameters(probe)
-            reps, probs = process_condition(
-                test_signals, group, noise_bank, encoder, probe,
+            reps, probs, snr_pre, snr_post, psd_hz, psd_pre, psd_post = process_condition(
+                test_signals, clean_filtered, group, noise_bank, encoder, probe,
                 device, cfg, norm_stats,
             )
             assert enc_hash_before == hash_parameters(encoder), "Encoder weights mutated"
@@ -174,6 +222,11 @@ def main():
                 os.path.join(cond_dir, "results.npz"),
                 representations=reps,
                 predictions=probs,
+                snr_pre_filter_db=snr_pre,
+                snr_post_filter_db=snr_post,
+                noise_psd_hz=psd_hz,
+                noise_psd_pre_filter=psd_pre,
+                noise_psd_post_filter=psd_post,
             )
 
     write_artifact_snapshot(
