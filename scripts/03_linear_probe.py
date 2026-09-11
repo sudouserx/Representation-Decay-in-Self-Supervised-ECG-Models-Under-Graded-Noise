@@ -23,7 +23,8 @@ if UTILS_DIR not in sys.path:
     sys.path.insert(0, UTILS_DIR)
 
 from ecg_ssl_utils.artifact import (
-    build_model_manifest, file_sha256, write_artifact_snapshot,
+    build_model_manifest, discover_ssl_model_dirs, file_sha256,
+    write_artifact_snapshot,
 )
 from ecg_ssl_utils.config import get_config
 from ecg_ssl_utils.eval.ece import expected_calibration_error
@@ -106,19 +107,12 @@ def tune_thresholds(y_true, y_prob, grid=None):
     return thresholds
 
 
-def discover_models():
-    import glob
-    model_dirs = glob.glob("/kaggle/input/ssl-*") + glob.glob("/kaggle/working/ssl-*")
-    model_dirs = [d for d in model_dirs if os.path.exists(os.path.join(d, "encoder.pt"))]
-    return {os.path.basename(d): d for d in model_dirs}
-
-
 def main():
     cfg = get_config()
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    unique_models = discover_models()
+    unique_models = discover_ssl_model_dirs()
     model_manifest = build_model_manifest(
         unique_models, cfg.ssl_training.pretrain_seeds,
     )

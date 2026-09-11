@@ -8,7 +8,6 @@ parity-gate vs FP32, and profile on a real ECG tensor.
 Kaggle Inputs: ssl-* models, linear-probes-all, ptbxl-clean-processed
 Kaggle Output: /kaggle/working/deployment-profiles/
 """
-import glob
 import json
 import os
 import sys
@@ -25,7 +24,7 @@ OUTPUT_DIR = "/kaggle/working/deployment-profiles"
 if UTILS_DIR not in sys.path:
     sys.path.insert(0, UTILS_DIR)
 
-from ecg_ssl_utils.artifact import write_artifact_snapshot
+from ecg_ssl_utils.artifact import discover_ssl_model_dirs, write_artifact_snapshot
 from ecg_ssl_utils.config import get_config
 from ecg_ssl_utils.deploy.onnx_export import ClassifierWrapper, export_to_onnx
 from ecg_ssl_utils.deploy.profiler import profile_model
@@ -72,8 +71,7 @@ def main():
     cfg = get_config()
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    model_dirs = glob.glob("/kaggle/input/ssl-*") + glob.glob("/kaggle/working/ssl-*")
-    unique_models = {os.path.basename(d): d for d in model_dirs if os.path.exists(os.path.join(d, "encoder.pt"))}
+    unique_models = discover_ssl_model_dirs()
 
     calib_path = os.path.join(CLEAN_DIR, "signals_train.npy")
     if not os.path.exists(calib_path):

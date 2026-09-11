@@ -1,13 +1,56 @@
 """Write config + seed + git hash snapshots into pipeline output directories."""
 
+import glob
 import json
 import os
 import subprocess
 import hashlib
+import warnings
 from dataclasses import asdict, is_dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .version import __version__
+
+SSL_MODEL_GLOBS: Tuple[str, ...] = (
+    "/kaggle/input/ssl-*",
+    "/kaggle/input/datasets/*/ssl-*",
+    "/kaggle/working/ssl-*",
+)
+
+
+def _checkpoint_dirs(root: str) -> List[str]:
+    """Return dirs under *root* that contain encoder.pt (root or one child)."""
+    if not os.path.isdir(root):
+        return []
+    if os.path.exists(os.path.join(root, "encoder.pt")):
+        return [root]
+    children = []
+    for name in sorted(os.listdir(root)):
+        child = os.path.join(root, name)
+        if os.path.isdir(child) and os.path.exists(os.path.join(child, "encoder.pt")):
+            children.append(child)
+    return children
+
+
+def discover_ssl_model_dirs() -> Dict[str, str]:
+    """Find SSL checkpoints on Kaggle input/working mounts, including nested datasets.
+
+    Later globs overwrite earlier ones on matching checkpoint basename so
+    `/kaggle/working` wins over published inputs.
+    """
+    found: Dict[str, str] = {}
+    for pattern in SSL_MODEL_GLOBS:
+        for root in glob.glob(pattern):
+            for ckpt_dir in _checkpoint_dirs(root):
+                found[os.path.basename(ckpt_dir)] = ckpt_dir
+    names = sorted(found)
+    print(f"Discovered SSL models ({len(names)}): {names}")
+    if not found:
+        raise FileNotFoundError(
+            "no SSL checkpoints with encoder.pt found; searched "
+            + ", ".join(SSL_MODEL_GLOBS)
+        )
+    return found
 
 
 def _jsonify(obj: Any) -> Any:
@@ -66,7 +109,11 @@ def file_sha256(path: str, chunk_size: int = 1024 * 1024) -> str:
 
 
 def build_model_manifest(model_dirs: Dict[str, str], required_seeds) -> Dict[str, Any]:
-    """Validate model identity and seed completeness before downstream use."""
+    """Validate model identity and seed completeness before downstream use.
+
+    Incomplete primary seed grids warn by default so a single-seed run can
+    proceed. Set REQUIRE_FULL_SEED_GRID=1 to restore a hard failure.
+    """
     rows = []
     primary_prefixes = (
         "ssl-simclr-", "ssl-clocs-vit", "ssl-mae-", "ssl-jepa-",
@@ -106,9 +153,14 @@ def build_model_manifest(model_dirs: Dict[str, str], required_seeds) -> Dict[str
         for stem in expected_stems if required - by_stem.get(stem, set())
     }
     if incomplete:
-        raise RuntimeError(f"incomplete primary pretraining seed grid: {incomplete}")
+        message = f"incomplete primary pretraining seed grid: {incomplete}"
+        if os.environ.get("REQUIRE_FULL_SEED_GRID", "").strip() == "1":
+            raise RuntimeError(message)
+        warnings.warn(message, UserWarning, stacklevel=2)
+        print(f"Warning: {message}")
     return {
         "models": rows,
         "required_primary_seeds": sorted(required),
+        "incomplete_primary_seed_grid": incomplete,
         "cohort_definition": "official_all_diagnostic_statements",
     }

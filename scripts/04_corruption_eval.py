@@ -26,20 +26,15 @@ OUTPUT_DIR = "/kaggle/working/corruption-eval-results"
 if UTILS_DIR not in sys.path:
     sys.path.insert(0, UTILS_DIR)
 
-from ecg_ssl_utils.artifact import file_sha256, write_artifact_snapshot
+from ecg_ssl_utils.artifact import (
+    discover_ssl_model_dirs, file_sha256, write_artifact_snapshot,
+)
 from ecg_ssl_utils.config import get_config
 from ecg_ssl_utils.data.preprocessing import bandpass_filter, load_norm_stats, normalize_signals
 from ecg_ssl_utils.models.resnet18_1d import ResNet18_1D
 from ecg_ssl_utils.models.vit_small_1d import ViTSmall1D
 from ecg_ssl_utils.noise.injection import compute_snr, inject_noise
 from ecg_ssl_utils.probe.linear_probe import LinearProbe
-
-
-def get_model_dirs():
-    import glob
-    model_dirs = glob.glob("/kaggle/input/ssl-*") + glob.glob("/kaggle/working/ssl-*")
-    model_dirs = [d for d in model_dirs if os.path.exists(os.path.join(d, "encoder.pt"))]
-    return {os.path.basename(d): d for d in model_dirs}
 
 
 def load_noise_bank():
@@ -168,7 +163,7 @@ def main():
 
     manifest = pd.read_parquet(os.path.join(NOISE_DIR, "noise_manifest.parquet"))
     noise_bank = load_noise_bank()
-    models = get_model_dirs()
+    models = discover_ssl_model_dirs()
     manifest_path = os.path.join(PROBE_DIR, "model_manifest.json")
     if not os.path.exists(manifest_path):
         raise FileNotFoundError("model_manifest.json missing; rerun script 03")
