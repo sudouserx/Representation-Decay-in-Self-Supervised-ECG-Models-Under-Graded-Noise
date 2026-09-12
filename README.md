@@ -172,7 +172,7 @@ flowchart LR
 
         QPAR["Quantization Parity<br/>Cosine(FP32, INT8) on 500 val samples<br/>Script 07 REJECT if cosine &lt; 0.999"]
 
-        P1["Latency p50 / p95 · CPU + CUDA ORT"]
+        P1["Latency p50 / p95 · CPU ORT only"]
 
         P2["Memory: process RSS delta (psutil)<br/>Not Python-heap tracemalloc"]
 
@@ -402,7 +402,7 @@ $$
 
 ### VI. Server-proxy deployment
 
-ONNX opset 17, **encoder + probe**. INT8 dynamic / static; static calibration uses **train** signals. Parity cosine(FP32, INT8) is measured on 500 val samples in script 06; script 07 REJECT if cosine &lt; `cfg.deploy.parity_min_cosine` (default 0.999). Profiler: real ECG input, warmup 50 / 1000 runs, p50/p95, throughput, **process RSS delta** (psutil), platform / CPU / GPU / ORT version. Energy is **not measured** and is not reported. There is no “selective attention-FP32 / FFN-INT8” mode.
+ONNX opset 17, **encoder + probe**. INT8 dynamic / static; static calibration uses **train** signals. Parity cosine(FP32, INT8) is measured on 500 val samples in script 06; script 07 REJECT if cosine &lt; `cfg.deploy.parity_min_cosine` (default 0.999). Profiler: **CPU ONNX Runtime only** (GPU inference EP is out of scope), real ECG input, warmup 50 / 1000 runs, p50/p95, throughput, **process RSS delta** (psutil), platform / CPU / ORT version. Energy is **not measured** and is not reported. There is no “selective attention-FP32 / FFN-INT8” mode.
 
 ---
 

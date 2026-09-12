@@ -8,7 +8,7 @@ wfdb
 torch
 onnx
 onnxscript
-onnxruntime-gpu
+onnxruntime
 statsmodels
 psutil
 pytest
