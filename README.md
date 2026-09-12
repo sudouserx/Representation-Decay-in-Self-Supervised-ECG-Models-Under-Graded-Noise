@@ -322,6 +322,8 @@ flowchart LR
     class R1,R2,R3 artifact
 ```
 
+---
+
 ## I. Data, labels, preprocessing, and noise
 
 ### Signal preprocessing
@@ -352,8 +354,6 @@ This cohort is not used as the primary label definition.
 
 ### Noise sources
 
-The corruption bank contains:
-
 **Empirical NSTDB noise**
 
 * Baseline wander: BW
@@ -366,7 +366,7 @@ The corruption bank contains:
 
 **Synthetic noise**
 
-* **Powerline:** 50 Hz plus harmonics with \(A_h = 1/h\)
+* **Powerline:** 50 Hz plus harmonics with $A_h = 1/h$
 * **Electrode-pop:** Poisson Gaussian transients
 * **Inverter:** band-limited burst model
 
@@ -381,11 +381,11 @@ Script 04 uses the following sequence:
 3. Apply the same 0.05–45 Hz preprocessing used for clean data.
 4. Apply the same train-derived normalization statistics.
 
-For corruption \(n\):
+For corruption $n$:
 
-$$
+```math
 x_{\text{noisy}} = x + k n
-$$
+```
 
 The noise realization is deterministic given:
 
@@ -405,23 +405,21 @@ Because the front end ends at 45 Hz, the preprocessing stage attenuates 50 Hz ma
 
 **Single-noise conditions**
 
-$$
+```math
 6\ \text{noise types} \times 6\ \text{SNR levels} \times 3\ \text{noise seeds} = 108
-$$
+```
 
 **Mixture conditions**
 
-$$
+```math
 3\ \text{mixtures} \times 6\ \text{SNR levels} \times 3\ \text{noise seeds} = 54
-$$
+```
 
 Total:
 
-$$
+```math
 108 + 54 = \mathbf{162}
-$$
-
-conditions per encoder.
+```
 
 SNR levels:
 
@@ -464,7 +462,7 @@ Training uses **epoch parity rather than compute parity**, with the per-method o
 
 `--seed` or `PRETRAIN_SEED` is required for pretraining runs.
 
-Outputs follow the pattern:
+Outputs follow:
 
 ```text
 ssl-<paradigm>-seed<seed>/
@@ -550,7 +548,7 @@ Early stopping on validation macro-AUROC
 
 ### Temperature scaling
 
-A single scalar temperature \(T^*\) is fitted to **raw validation logits**.
+A single scalar temperature $T^*$ is fitted to **raw validation logits**.
 
 The fitted temperature is applied exactly once in the inference path:
 
@@ -622,11 +620,11 @@ Representation analysis uses the **last-layer CLS representation**.
 
 **Linear CKA**
 
-$$
+```math
 \Delta \mathrm{CKA}
 =
 1-\mathrm{CKA}(X_{\text{clean}},X_{\text{noisy}})
-$$
+```
 
 A variance-collapse guard is applied before interpreting CKA.
 
@@ -634,20 +632,19 @@ A variance-collapse guard is applied before interpreting CKA.
 
 Effective rank is computed from the CLS matrix:
 
-$$
-X \in \mathbb{R}^{n_{\text{samples}}\times d_{\text{embed}}}
-$$
+```math
+X \in \mathbb{R}^{n_{\text{samples}} \times d_{\text{embed}}}
+```
 
 The robustness index uses the two-sided effective-rank change:
 
-$$
+```math
 \Delta \mathrm{ER}
 =
 \left|
-1-\frac{\mathrm{ER}_{\text{noisy}}}
-{\mathrm{ER}_{\text{clean}}}
+1-\frac{\mathrm{ER}_{n}}{\mathrm{ER}_{c}}
 \right|
-$$
+```
 
 CKA and effective-rank measurements are treated as **representation-shift diagnostics**. They are not, by themselves, evidence that task-relevant information has been lost. Interpretation of representation decay is therefore tied primarily to changes in task performance and calibration.
 
@@ -727,7 +724,7 @@ bh_family.json
 
 The robustness index is a **secondary reporting and ranking convenience**. The underlying four dimensions remain the primary evidence.
 
-$$
+```math
 R =
 0.30(1-\Delta\mathrm{AUROC}_{n})
 +
@@ -736,35 +733,35 @@ R =
 0.20(1-\Delta\mathrm{CKA}_{n})
 +
 0.20(1-\Delta\mathrm{ER}_{n})
-$$
+```
 
-where:
+The component deltas are:
 
-$$
+```math
 \Delta\mathrm{CKA}
 =
 1-\mathrm{CKA}
-$$
+```
 
-$$
+```math
 \Delta\mathrm{ER}
 =
 \left|
 1-\frac{\mathrm{ER}_{n}}{\mathrm{ER}_{c}}
 \right|
-$$
+```
 
-$$
+```math
 \Delta\mathrm{AUROC}
 =
 \max(0,\mathrm{AUC}_{c}-\mathrm{AUC}_{n})
-$$
+```
 
-$$
+```math
 \Delta\mathrm{ECE}
 =
 \max(0,\mathrm{ECE}_{n}-\mathrm{ECE}_{c})
-$$
+```
 
 The deltas are min-max normalized **within the current run**. The normalization anchors are stored in:
 
@@ -772,7 +769,7 @@ The deltas are min-max normalized **within the current run**. The normalization 
 normalization_anchors.json
 ```
 
-Therefore, \(R\) is intended for **within-run comparison** and should not be compared numerically across papers or independently reproduced runs with different normalization anchors.
+Therefore, $R$ is intended for **within-run comparison** and should not be compared numerically across papers or independently reproduced runs with different normalization anchors.
 
 ### Decision filters
 
@@ -783,7 +780,7 @@ AUROC < 0.70
 ECE > 0.15
 ```
 
-A failed filter does **not** set \(R=0\).
+A failed filter does **not** set $R=0$.
 
 The unaggregated evidence is retained in:
 
@@ -864,9 +861,11 @@ The profiling protocol uses:
 
 Throughput is calculated as:
 
-$$
-\mathrm{throughput} = \frac{1}{\mathrm{mean\ latency}}
-$$
+```math
+\mathrm{throughput}
+=
+\frac{1}{\mathrm{mean\ latency}}
+```
 
 Energy consumption is not measured and is not reported.
 
