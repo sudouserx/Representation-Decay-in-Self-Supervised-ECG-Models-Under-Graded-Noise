@@ -18,6 +18,7 @@ from collections import defaultdict
 
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 CLEAN_DIR = os.environ.get("CLEAN_DIR", "/kaggle/input/ptbxl-clean-processed")
 EVAL_DIR = os.environ.get("EVAL_DIR", "/kaggle/input/corruption-eval-results")
@@ -29,15 +30,16 @@ if UTILS_DIR not in sys.path:
 
 from ecg_ssl_utils.artifact import write_artifact_snapshot
 from ecg_ssl_utils.config import get_config
-from ecg_ssl_utils.eval.auroc import macro_auroc, subgroup_auroc
+from ecg_ssl_utils.eval.auroc import binary_auroc, macro_auroc, subgroup_auroc
 from ecg_ssl_utils.eval.bootstrap import (
+    make_patient_bootstrap_draws,
     patient_bootstrap_ci,
     patient_bootstrap_pvalue,
 )
-from ecg_ssl_utils.eval.cka import linear_cka
+from ecg_ssl_utils.eval.cka import bootstrap_mean_linear_cka, linear_cka
 from ecg_ssl_utils.eval.delong import delong_test
 from ecg_ssl_utils.eval.ece import expected_calibration_error
-from ecg_ssl_utils.eval.effective_rank import effective_rank
+from ecg_ssl_utils.eval.effective_rank import bootstrap_mean_effective_rank, effective_rank
 from ecg_ssl_utils.eval.f1 import per_class_f1
 from ecg_ssl_utils.eval.prauc import per_class_brier, per_class_pr_auc
 
@@ -112,28 +114,29 @@ def _metric_bundle(labels, preds, reps, clean_reps, class_names, thresholds, cfg
     }
 
 
-def compute_clean_reference(enc, clean_reps, clean_preds, labels, pids, cfg, class_names, thresholds):
+def compute_clean_reference(
+    enc, clean_reps, clean_preds, labels, pids, cfg, class_names, thresholds,
+    draws=None, er_draws=None,
+):
     pretrain_seed, sensitivity = _parse_encoder_name(enc)
     bundle = _metric_bundle(labels, clean_preds, clean_reps, clean_reps, class_names, thresholds, cfg, pids)
     _, auroc_lo, auroc_hi = patient_bootstrap_ci(
         lambda idx: macro_auroc(labels[idx], clean_preds[idx]),
         pids, n_bootstrap=cfg.eval.bootstrap_n, seed=cfg.eval.bootstrap_seed,
-        point_estimate=bundle["auroc"],
+        point_estimate=bundle["auroc"], draws=draws,
     )
     _, ece_lo, ece_hi = patient_bootstrap_ci(
         lambda idx: expected_calibration_error(labels[idx], clean_preds[idx], n_bins=cfg.eval.ece_bins),
         pids, n_bootstrap=cfg.eval.bootstrap_n, seed=cfg.eval.bootstrap_seed,
-        point_estimate=bundle["ece"],
+        point_estimate=bundle["ece"], draws=draws,
     )
-    def _er(idx):
-        sub = clean_reps[idx]
-        if len(sub) > cfg.eval.er_bootstrap_subsample:
-            rng = np.random.RandomState(cfg.eval.bootstrap_seed)
-            sub = sub[rng.choice(len(sub), cfg.eval.er_bootstrap_subsample, replace=False)]
-        return effective_rank(sub, n_components=64, seed=cfg.eval.bootstrap_seed)
-    _, er_lo, er_hi = patient_bootstrap_ci(
-        _er, pids, n_bootstrap=cfg.eval.er_bootstrap_n, seed=cfg.eval.bootstrap_seed,
-        point_estimate=bundle["erank"],
+    if er_draws is None:
+        er_draws = make_patient_bootstrap_draws(
+            pids, cfg.eval.er_bootstrap_n, cfg.eval.bootstrap_seed,
+        )
+    _, er_lo, er_hi = bootstrap_mean_effective_rank(
+        clean_reps, er_draws, n_components=64, seed=cfg.eval.bootstrap_seed,
+        subsample=cfg.eval.er_bootstrap_subsample, point_estimate=bundle["erank"],
     )
     return {
         "encoder": enc,
@@ -147,10 +150,9 @@ def compute_clean_reference(enc, clean_reps, clean_preds, labels, pids, cfg, cla
 
 
 def _per_class_auroc(y, p, c):
-    from sklearn.metrics import roc_auc_score
     if y[:, c].sum() < 5 or (1 - y[:, c]).sum() < 1:
         return float("nan")
-    return float(roc_auc_score(y[:, c], p[:, c]))
+    return binary_auroc(y[:, c], p[:, c])
 
 
 def _bh_adjust(p_values):
@@ -171,6 +173,78 @@ def _bh_adjust(p_values):
         return adj
 
 
+def _cell_key(enc, ntype, snr):
+    return (str(enc), str(ntype), float(snr))
+
+
+def _load_resume_frames():
+    paths = {
+        "seed": os.path.join(OUTPUT_DIR, "metric_curves_per_seed.parquet"),
+        "agg": os.path.join(OUTPUT_DIR, "metric_curves.parquet"),
+        "tests": os.path.join(OUTPUT_DIR, "hypothesis_tests.parquet"),
+    }
+    frames = {}
+    for name, path in paths.items():
+        frames[name] = pd.read_parquet(path) if os.path.exists(path) else pd.DataFrame()
+    done = set()
+    if not frames["agg"].empty:
+        for _, row in frames["agg"].iterrows():
+            done.add(_cell_key(row["encoder"], row["noise_type"], row["snr_db"]))
+    return frames["seed"], frames["agg"], frames["tests"], done
+
+
+def _write_partial(df_seed, df_agg, df_tests):
+    if not df_seed.empty:
+        df_seed.to_parquet(os.path.join(OUTPUT_DIR, "metric_curves_per_seed.parquet"), index=False)
+    if not df_agg.empty:
+        df_agg.to_parquet(os.path.join(OUTPUT_DIR, "metric_curves.parquet"), index=False)
+    if not df_tests.empty:
+        df_tests.to_parquet(os.path.join(OUTPUT_DIR, "hypothesis_tests.parquet"), index=False)
+
+
+def _expected_noise_grid(cfg):
+    types = list(cfg.noise.noise_types_single)
+    types.extend(m["name"] for m in cfg.noise.mixed_noise_configs)
+    return types, list(cfg.noise.snr_grid)
+
+
+def _grid_completeness(df_agg, encoders, cfg, grouped_keys):
+    types, snrs = _expected_noise_grid(cfg)
+    missing = []
+    for enc in encoders:
+        for ntype in types:
+            for snr in snrs:
+                key = _cell_key(enc, ntype, snr)
+                if key not in grouped_keys:
+                    missing.append({"encoder": enc, "noise_type": ntype, "snr_db": snr, "reason": "absent_from_eval_inputs"})
+                elif df_agg.empty or not (
+                    (df_agg["encoder"] == enc)
+                    & (df_agg["noise_type"] == ntype)
+                    & np.isclose(df_agg["snr_db"].astype(float), float(snr))
+                ).any():
+                    missing.append({"encoder": enc, "noise_type": ntype, "snr_db": snr, "reason": "not_computed"})
+    complete = len(missing) == 0
+    note = {
+        "complete": complete,
+        "citeable": complete,
+        "n_missing": len(missing),
+        "expected_noise_types": types,
+        "expected_snr_db": snrs,
+        "missing": missing[:200],
+        "note": "Do not cite metric_curves.parquet unless complete is true.",
+    }
+    with open(os.path.join(OUTPUT_DIR, "grid_complete.json"), "w") as f:
+        json.dump(note, f, indent=2)
+    if complete:
+        print("Grid complete: all configured noise types × SNRs present for every encoder.")
+    else:
+        print(
+            f"WARNING: incomplete noise grid ({len(missing)} missing cells). "
+            "This run is not citeable. See grid_complete.json. Resume after fixing inputs."
+        )
+    return complete
+
+
 def main():
     cfg = get_config()
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -183,6 +257,16 @@ def main():
 
     import glob
     encoders = [os.path.basename(d) for d in glob.glob(os.path.join(EVAL_DIR, "ssl-*"))]
+
+    print("Precomputing patient bootstrap draws...")
+    draws = make_patient_bootstrap_draws(pids, cfg.eval.bootstrap_n, cfg.eval.bootstrap_seed)
+    er_draws = draws[: cfg.eval.er_bootstrap_n]
+    try:
+        import torch
+        geo_dev = "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        geo_dev = "cpu"
+    print(f"  n_bootstrap={cfg.eval.bootstrap_n} er_bootstrap_n={cfg.eval.er_bootstrap_n} geometry_device={geo_dev}")
 
     print("Computing clean reference metrics...")
     clean_refs = []
@@ -197,6 +281,7 @@ def main():
         thresholds = _load_thresholds(enc, n_classes)
         ref = compute_clean_reference(
             enc, clean_reps, clean_preds, labels_test, pids, cfg, class_names, thresholds,
+            draws=draws, er_draws=er_draws,
         )
         if "age" in test_meta.columns:
             ref["subgroup_age"] = json.dumps(subgroup_auroc(labels_test, clean_preds, test_meta["age"].values))
@@ -209,7 +294,6 @@ def main():
     pd.DataFrame(clean_refs).to_parquet(os.path.join(OUTPUT_DIR, "clean_reference.parquet"), index=False)
 
     print("\nLoading per-seed noisy predictions...")
-    per_seed_rows = []
     grouped = defaultdict(list)
     for enc in encoders:
         if enc not in clean_store:
@@ -227,9 +311,18 @@ def main():
             grouped[(enc, ntype, snr)].append((seed, data["representations"].astype(np.float32), data["predictions"]))
 
     print("Aggregating noise seeds (average probabilities, then metrics + CI)...")
-    agg_rows = []
-    test_rows = []
-    for (enc, ntype, snr), items in grouped.items():
+    df_seed, df_agg, df_tests, done_keys = _load_resume_frames()
+    per_seed_rows = [] if df_seed.empty else df_seed.to_dict("records")
+    agg_rows = [] if df_agg.empty else df_agg.to_dict("records")
+    test_rows = [] if df_tests.empty else df_tests.to_dict("records")
+    if done_keys:
+        print(f"  Resuming: {len(done_keys)} cells already written.")
+
+    items_iter = list(grouped.items())
+    for (enc, ntype, snr), items in tqdm(items_iter, desc="Decay cells"):
+        key = _cell_key(enc, ntype, snr)
+        if key in done_keys:
+            continue
         clean_reps, clean_preds, thresholds = clean_store[enc]
         pretrain_seed, sensitivity = _parse_encoder_name(enc)
         items = sorted(items, key=lambda x: x[0])
@@ -268,7 +361,7 @@ def main():
             try:
                 dlt, pval = patient_bootstrap_pvalue(
                     _delta, pids, n_bootstrap=cfg.eval.bootstrap_n,
-                    seed=cfg.eval.bootstrap_seed,
+                    seed=cfg.eval.bootstrap_seed, draws=draws,
                 )
             except Exception:
                 dlt, pval = float("nan"), 1.0
@@ -289,35 +382,21 @@ def main():
         _, auc_lo, auc_hi = patient_bootstrap_ci(
             lambda idx: macro_auroc(labels_test[idx], avg_preds[idx]),
             pids, n_bootstrap=cfg.eval.bootstrap_n, seed=cfg.eval.bootstrap_seed,
-            point_estimate=bundle["auroc"],
+            point_estimate=bundle["auroc"], draws=draws,
         )
         _, ece_lo, ece_hi = patient_bootstrap_ci(
             lambda idx: expected_calibration_error(labels_test[idx], avg_preds[idx], n_bins=cfg.eval.ece_bins),
             pids, n_bootstrap=cfg.eval.bootstrap_n, seed=cfg.eval.bootstrap_seed,
-            point_estimate=bundle["ece"],
+            point_estimate=bundle["ece"], draws=draws,
         )
-        _, cka_lo, cka_hi = patient_bootstrap_ci(
-            lambda idx: np.nanmean([
-                linear_cka(clean_reps[idx], reps[idx], var_guard=cfg.eval.collapse_var_guard)
-                for reps in rep_stack
-            ]),
-            pids, n_bootstrap=cfg.eval.bootstrap_n, seed=cfg.eval.bootstrap_seed,
-            point_estimate=bundle["cka"] if not np.isnan(bundle["cka"]) else 0.0,
+        cka_point = bundle["cka"] if not np.isnan(bundle["cka"]) else 0.0
+        _, cka_lo, cka_hi = bootstrap_mean_linear_cka(
+            clean_reps, rep_stack, draws, var_guard=cfg.eval.collapse_var_guard,
+            point_estimate=cka_point,
         )
-
-        def _er(idx):
-            vals = []
-            for reps in rep_stack:
-                sub = reps[idx]
-                if len(sub) > cfg.eval.er_bootstrap_subsample:
-                    rng = np.random.RandomState(cfg.eval.bootstrap_seed)
-                    sub = sub[rng.choice(len(sub), cfg.eval.er_bootstrap_subsample, replace=False)]
-                vals.append(effective_rank(sub, n_components=64, seed=cfg.eval.bootstrap_seed))
-            return float(np.nanmean(vals))
-
-        _, er_lo, er_hi = patient_bootstrap_ci(
-            _er, pids, n_bootstrap=cfg.eval.er_bootstrap_n, seed=cfg.eval.bootstrap_seed,
-            point_estimate=bundle["erank"],
+        _, er_lo, er_hi = bootstrap_mean_effective_rank(
+            rep_stack, er_draws, n_components=64, seed=cfg.eval.bootstrap_seed,
+            subsample=cfg.eval.er_bootstrap_subsample, point_estimate=bundle["erank"],
         )
         seed_aurocs = [macro_auroc(labels_test, p) for _, _, p in items]
         agg_rows.append({
@@ -330,6 +409,8 @@ def main():
             "auroc_noise_seed_sd": float(np.std(seed_aurocs)),
             "n_noise_seeds": len(items),
         })
+        done_keys.add(key)
+        _write_partial(pd.DataFrame(per_seed_rows), pd.DataFrame(agg_rows), pd.DataFrame(test_rows))
 
     df_seed = pd.DataFrame(per_seed_rows)
     df_agg = pd.DataFrame(agg_rows)
@@ -368,6 +449,9 @@ def main():
 
     df_seed.to_parquet(os.path.join(OUTPUT_DIR, "metric_curves_per_seed.parquet"), index=False)
     df_agg.to_parquet(os.path.join(OUTPUT_DIR, "metric_curves.parquet"), index=False)
+
+    grouped_keys = {_cell_key(enc, ntype, snr) for (enc, ntype, snr) in grouped}
+    _grid_completeness(df_agg, list(clean_store.keys()), cfg, grouped_keys)
 
     if not df_agg.empty and "pretrain_seed" in df_agg.columns:
         prim = df_agg[~df_agg["sensitivity_arm"]].copy()
