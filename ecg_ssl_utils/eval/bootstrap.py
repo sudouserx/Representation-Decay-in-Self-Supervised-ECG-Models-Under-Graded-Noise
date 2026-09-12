@@ -1,8 +1,11 @@
 """Patient-level bootstrap confidence intervals and paired tests."""
-from typing import Callable, Optional, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 
 import numpy as np
 from scipy.stats import norm
+
+
+_DRAW_CACHE = {}
 
 
 def _patient_index_map(patient_ids: np.ndarray):
@@ -10,15 +13,59 @@ def _patient_index_map(patient_ids: np.ndarray):
     p2idx = {}
     for i, pid in enumerate(patient_ids):
         p2idx.setdefault(pid, []).append(i)
+    for pid in list(p2idx):
+        p2idx[pid] = np.asarray(p2idx[pid], dtype=np.int64)
     return unique_patients, p2idx
 
 
 def _resample_indices(rng, unique_patients, p2idx):
     sampled = rng.choice(unique_patients, size=len(unique_patients), replace=True)
-    idx = []
-    for pid in sampled:
-        idx.extend(p2idx[pid])
-    return np.array(idx)
+    return np.concatenate([p2idx[pid] for pid in sampled])
+
+
+def _cache_key(patient_ids: np.ndarray, n_bootstrap: int, seed: int):
+    ids = np.asarray(patient_ids)
+    return (
+        int(n_bootstrap),
+        int(seed),
+        ids.shape,
+        ids.dtype.str,
+        int(ids[0]) if ids.size else 0,
+        int(ids[-1]) if ids.size else 0,
+        hash(ids.tobytes()),
+    )
+
+
+def make_patient_bootstrap_draws(
+    patient_ids: np.ndarray,
+    n_bootstrap: int = 1000,
+    seed: int = 42,
+    use_cache: bool = True,
+) -> List[np.ndarray]:
+    """
+    Patient-clustered index draws.
+
+    Uses the same RNG walk as a fresh ``RandomState(seed)`` loop of
+    ``_resample_indices``, so caching is statistically identical to calling
+    ``patient_bootstrap_ci`` independently with the same seed.
+    """
+    key = _cache_key(patient_ids, n_bootstrap, seed)
+    if use_cache and key in _DRAW_CACHE:
+        return _DRAW_CACHE[key]
+
+    rng = np.random.RandomState(seed)
+    unique_patients, p2idx = _patient_index_map(patient_ids)
+    draws = [
+        _resample_indices(rng, unique_patients, p2idx)
+        for _ in range(n_bootstrap)
+    ]
+    if use_cache:
+        _DRAW_CACHE[key] = draws
+    return draws
+
+
+def clear_bootstrap_draw_cache():
+    _DRAW_CACHE.clear()
 
 
 def patient_bootstrap_ci(
@@ -28,6 +75,7 @@ def patient_bootstrap_ci(
     seed: int = 42,
     alpha: float = 0.05,
     point_estimate: Optional[float] = None,
+    draws: Optional[Sequence[np.ndarray]] = None,
     **metric_kwargs,
 ) -> Tuple[float, float, float]:
     """
@@ -36,20 +84,20 @@ def patient_bootstrap_ci(
     *point* is the full-sample metric (or *point_estimate* if provided),
     not the mean of the bootstrap distribution.
     """
-    rng = np.random.RandomState(seed)
-    unique_patients, p2idx = _patient_index_map(patient_ids)
-
     if point_estimate is None:
         point = float(metric_fn(np.arange(len(patient_ids)), **metric_kwargs))
     else:
         point = float(point_estimate)
 
-    boots = []
-    for _ in range(n_bootstrap):
-        idx = _resample_indices(rng, unique_patients, p2idx)
-        boots.append(metric_fn(idx, **metric_kwargs))
+    if draws is None:
+        draws = make_patient_bootstrap_draws(patient_ids, n_bootstrap, seed)
+    else:
+        draws = draws[:n_bootstrap]
 
-    boots = np.asarray(boots, dtype=float)
+    boots = np.asarray(
+        [metric_fn(idx, **metric_kwargs) for idx in draws],
+        dtype=float,
+    )
     lo = np.nanpercentile(boots, 100 * alpha / 2)
     hi = np.nanpercentile(boots, 100 * (1 - alpha / 2))
     return point, float(lo), float(hi)
@@ -60,6 +108,7 @@ def patient_bootstrap_pvalue(
     patient_ids: np.ndarray,
     n_bootstrap: int = 1000,
     seed: int = 42,
+    draws: Optional[Sequence[np.ndarray]] = None,
 ) -> Tuple[float, float]:
     """
     Two-sided patient-clustered bootstrap p-value for a paired delta.
@@ -68,19 +117,28 @@ def patient_bootstrap_pvalue(
     p = 2 * min(frac(Δ* ≤ 0), frac(Δ* ≥ 0)), using the bootstrap distribution of Δ
     (shift / percentile method). Returns (observed_delta, p_two_sided).
     """
-    rng = np.random.RandomState(seed)
-    unique_patients, p2idx = _patient_index_map(patient_ids)
     observed = float(delta_fn(np.arange(len(patient_ids))))
-    boots = []
-    for _ in range(n_bootstrap):
-        idx = _resample_indices(rng, unique_patients, p2idx)
-        boots.append(float(delta_fn(idx)))
-    boots = np.asarray(boots, dtype=float)
+    if draws is None:
+        draws = make_patient_bootstrap_draws(patient_ids, n_bootstrap, seed)
+    else:
+        draws = draws[:n_bootstrap]
+    boots = np.asarray([float(delta_fn(idx)) for idx in draws], dtype=float)
     frac_le = float(np.mean(boots <= 0))
     frac_ge = float(np.mean(boots >= 0))
     p = 2.0 * min(frac_le, frac_ge)
     p = min(1.0, max(p, 1.0 / (n_bootstrap + 1)))
     return observed, p
+
+
+def percentile_ci_from_boots(
+    boots: np.ndarray,
+    point: float,
+    alpha: float = 0.05,
+) -> Tuple[float, float, float]:
+    boots = np.asarray(boots, dtype=float)
+    lo = np.nanpercentile(boots, 100 * alpha / 2)
+    hi = np.nanpercentile(boots, 100 * (1 - alpha / 2))
+    return float(point), float(lo), float(hi)
 
 
 def stouffer_combine(p_values, two_sided=True):
