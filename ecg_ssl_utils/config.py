@@ -225,11 +225,12 @@ class DeployConfig:
         'fp32', 'int8_dynamic', 'int8_static'
     ])
     providers: List[str] = field(default_factory=lambda: [
-        'CPUExecutionProvider', 'CUDAExecutionProvider'
+        'CPUExecutionProvider'
     ])
     warmup_runs: int = 50
     benchmark_runs: int = 1000
     calibration_samples: int = 200
+    calibration_seed: int = 42
     parity_samples: int = 500
     parity_min_cosine: float = 0.999
     opset_version: int = 17
