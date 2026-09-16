@@ -1,0 +1,14 @@
+{
+  "mean_kendall_tau": 0.8096400669642858,
+  "frac_top1_agreement": 0.9638671875,
+  "per_model_stability": {
+    "ssl-clocs-vit-small-seed42": 0.9931640625,
+    "ssl-jepa-vit-small-seed42": 0.6298828125,
+    "ssl-clocs-resnet18-seed42": 0.9638671875,
+    "ssl-mae-vit-small-seed42": 0.6611328125,
+    "ssl-simclr-vit-small-seed42": 0.3828125,
+    "ssl-swav-vit-small-seed42": 0.2001953125,
+    "ssl-supervised-vit-small-seed42": 0.5859375,
+    "ssl-byol-vit-small-seed42": 0.8232421875
+  }
+}
