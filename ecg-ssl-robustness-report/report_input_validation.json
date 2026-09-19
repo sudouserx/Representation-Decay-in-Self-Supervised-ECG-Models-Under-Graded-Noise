@@ -1,0 +1,52 @@
+{
+  "status": "PASS",
+  "decay_rows": 972,
+  "unique_encoders": 18,
+  "clean_reference_rows": 18,
+  "pretrain_seed_counts_decay": {
+    "42": 432,
+    "123": 270,
+    "456": 270
+  },
+  "pretrain_seed_counts_clean_reference": {
+    "42": 8,
+    "123": 5,
+    "456": 5
+  },
+  "primary_seed_sets": {
+    "ssl-simclr-vit-small": [
+      42,
+      123,
+      456
+    ],
+    "ssl-clocs-vit-small": [
+      42,
+      123,
+      456
+    ],
+    "ssl-mae-vit-small": [
+      42,
+      123,
+      456
+    ],
+    "ssl-jepa-vit-small": [
+      42,
+      123,
+      456
+    ],
+    "ssl-supervised-vit-small": [
+      42,
+      123,
+      456
+    ]
+  },
+  "sensitivity_models": [
+    "ssl-byol-vit-small-seed42",
+    "ssl-clocs-resnet18-seed42",
+    "ssl-swav-vit-small-seed42"
+  ],
+  "deployment": {
+    "models": 18,
+    "missing_models": []
+  }
+}
